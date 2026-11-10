@@ -177,8 +177,20 @@ function makeFakeIDB() {
   };
 }
 
-/* ------------------------------ 运行产物 ------------------------------ */
-function runUserscript({ withIndexedDB = true, idb = null, ls = null } = {}) {
+/** 模拟「另一个标签页还开着老版本连接，导致版本升级被堵住」：open 只抛 blocked，永不成功 */
+function makeBlockedIDB() {
+  return {
+    open() {
+      const req = { result: null, error: null, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null };
+      setTimeout(() => {
+        if (req.onblocked) req.onblocked();
+      }, 0);
+      return req;
+    },
+  };
+}
+
+/* ------------------------------ 运行产物 ------------------------------ */function runUserscript({ withIndexedDB = true, idb = null, ls = null } = {}) {
   const code = readFileSync(ARTIFACT, 'utf8');
   const lsData = new Map(ls ? Object.entries(ls) : []);
   const sandbox = {
@@ -311,6 +323,22 @@ test('indexedDB 不可用时降级：脚本仍能加载，记录层接口可用�
   assert.equal(sb.__dyPush.count(), 0);
   assert.equal(await sb.__dyPush.init(), 0);
   assert.equal(sb.__dyPush.get('x'), null);
+});
+
+test('indexedDB 被其他标签页占用时快速降级，不把面板 / 推送卡死', async () => {
+  const sb = runUserscript({ idb: makeBlockedIDB() });
+  assert.ok(sb.__dyPush, '被占用时脚本仍应加载成功');
+  // 2.1.0 的线上 bug：open 永远不 settle → init / 状态加载挂起 → 全选与推送全卡住
+  const result = await Promise.race([
+    sb.__dyPush.init().then(
+      (m) => 'resolved:' + (m ? m.size : 'null'),
+      (err) => 'rejected:' + err.message
+    ),
+    new Promise((r) => setTimeout(() => r('hang'), 3000)),
+  ]);
+  assert.notEqual(result, 'hang', 'init 不应等待超过 3 秒（实际挂起）');
+  assert.equal(sb.__dyPush.count(), 0);
+  assert.equal(sb.__dyPush.get('7301234567890123456'), null);
 });
 
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */

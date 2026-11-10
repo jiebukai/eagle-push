@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.1.0
+// @version         2.1.1
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -10879,11 +10879,49 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   var PUSH_NAME_MAX = 60;
   var PUSH_RECORD_TTL_MS = 365 * 24 * 60 * 60 * 1e3;
   // 0 = 不过期
+  // 打开超时：旧版脚本的连接没处理 versionchange，会把 v3 升级堵死；
+  // 一旦被堵，indexedDB.open 永远不 settle，面板选择态与推送记录都会一直等下去。
+  // 所以这里必须自己兜底超时，失败后快速失败一段时间，避免每次调用都排队新的 open。
+  var DB_OPEN_TIMEOUT_MS = 4e3;
+  var DB_RETRY_AFTER_MS = 3e4;
+  var dbBlockedAt = 0;
+  var dbBlockedReason = '';
+  function dbIsBlocked() {
+    return dbBlockedAt > 0 && Date.now() - dbBlockedAt < DB_RETRY_AFTER_MS;
+  }
+  function markDBBlocked(reason) {
+    dbBlockedAt = Date.now();
+    dbBlockedReason = reason || '未知原因';
+    try {
+      console.warn(
+        '[dy-dl] IndexedDB 暂不可用：' +
+          dbBlockedReason +
+          '（推送记录与主页选择态降级为内存模式，' +
+          DB_RETRY_AFTER_MS / 1e3 +
+          ' 秒后自动重试）'
+      );
+    } catch {}
+  }
   function getProfileStateDB() {
     if (!dbPromise) {
+      if (dbIsBlocked()) return Promise.reject(new Error('IndexedDB 暂不可用：' + dbBlockedReason));
       dbPromise = new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const finish = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          fn(value);
+        };
+        const fail = (reason) => {
+          dbPromise = null;
+          markDBBlocked(reason);
+          finish(reject, new Error(reason));
+        };
         try {
           const request = indexedDB.open(DB_NAME, DB_VERSION);
+          timer = setTimeout(() => fail('打开超时'), DB_OPEN_TIMEOUT_MS);
           request.onupgradeneeded = () => {
             const db = request.result;
             if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -10910,18 +10948,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
               }
             }
           };
-          request.onsuccess = () => resolve(request.result);
+          request.onsuccess = () => {
+            const db = request.result;
+            // 别的标签页要升级版本时主动让路，否则会互相堵死（旧版脚本正是缺这段）
+            try {
+              db.onversionchange = () => {
+                try {
+                  db.close();
+                } catch {}
+              };
+            } catch {}
+            finish(resolve, db);
+          };
           request.onerror = () => {
-            dbPromise = null;
-            reject(request.error);
+            const err = request.error;
+            fail('打开失败：' + ((err && (err.name || err.message)) || '未知错误'));
           };
-          request.onblocked = () => {
-            dbPromise = null;
-            reject(new Error('IndexedDB blocked'));
-          };
+          request.onblocked = () => fail('被其他抖音标签页占用');
         } catch (error) {
           dbPromise = null;
-          reject(error);
+          markDBBlocked('打开异常：' + ((error && (error.message || error.name)) || error));
+          finish(reject, error);
         }
       });
     }
@@ -11503,7 +11550,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     remove: (id) => PushHistory.remove(id),
     clear: () => PushHistory.clear(),
     prune: () => PushHistory.prune(),
-    init: () => PushHistory.init().then((m) => (m ? m.size : 0))
+    init: () => PushHistory.init().then((m) => (m ? m.size : 0)),
+    /** IndexedDB 是否处于降级状态（被别的标签页占用 / 打开超时） */
+    dbStatus: () => ({
+      blocked: dbIsBlocked(),
+      reason: dbBlockedReason || '',
+      since: dbBlockedAt || 0
+    })
   };
   // 注意：脚本声明了 @grant，Tampermonkey 会把它放进沙箱运行 —— 此时脚本里的 window
   // 是「沙箱的 window」，页面控制台看不到挂在它上面的属性。所以额外挂到：
@@ -11750,7 +11803,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       this._loadPromise = null;
       this._loadProfileKey = '';
       this._saveQueue = Promise.resolve();
-      this._storageInit = ProfileDownloadState.migrateLegacyStorage().then(() => ProfileDownloadState.pruneOldStates());
+      this._storageInit = ProfileDownloadState.migrateLegacyStorage()
+        .then(() => ProfileDownloadState.pruneOldStates())
+        // 数据库被占用时不能让这个 promise 挂住/抛错：否则面板永远拿不到 jobState
+        .catch((err) => {
+          console.warn('[dy-dl] 下载状态存储不可用（本次会话降级为内存状态）', err);
+        });
       this.mediaHandler = mediaHandler2;
       this.dataService = dataService;
       const collect = throttle(this.collect.bind(this), 1e3);
@@ -11831,7 +11889,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         await this._storageInit;
         const state = this.jobState;
         if (!state?.profileKey || state.profileKey !== profileKey) return state;
-        return ProfileDownloadState.save(profileKey, state);
+        try {
+          return await ProfileDownloadState.save(profileKey, state);
+        } catch (err) {
+          // 存储不可用时只影响「下次打开还记得选择」，不影响本次会话
+          return state;
+        }
       });
       this._saveQueue = run.then(
         () => void 0,

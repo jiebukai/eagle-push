@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.0.0
+// @version         2.1.0
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -4478,9 +4478,9 @@ return (${body})`
       }
     };
     /** 导出记录为 JSON 文件 */
-    const exportPushRecords = () => {
+    const exportPushRecords = async () => {
       try {
-        const data = PushHistory.exportData();
+        const data = await PushHistory.exportData();
         if (!data.records.length) {
           alert('当前没有推送记录可导出');
           return;
@@ -5062,9 +5062,32 @@ return (${body})`
                         })
                     }),
                     jsx('span', {
-                      children: '永久保留（默认 365 天后自动清理，最多 5000 条）'
+                      children: '永久保留（默认 365 天后自动清理）'
                     })
                   ]
+                })
+              ]
+            }),
+            jsx('div', {
+              className: configModalStyles.row,
+              children: [
+                jsx('span', {
+                  className: configModalStyles.label,
+                  children: '记录上限'
+                }),
+                jsx('select', {
+                  style: {
+                    padding: '4px 8px',
+                    borderRadius: '6px'
+                  },
+                  value: String(readPushCfg().cap),
+                  onChange: (e3) => setPushField({ push_record_cap: Number(e3.target.value) }),
+                  children: PUSH_CAP_OPTIONS.map((cap) =>
+                    jsx('option', {
+                      value: String(cap),
+                      children: cap > 0 ? cap + ' 条' : '不限'
+                    })
+                  )
                 })
               ]
             }),
@@ -10842,13 +10865,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   }
   // ─── src/core/download/ProfileDownloadState.ts · IndexedDB 存储层 ───
   var DB_NAME = 'dy-dl-profile-download-state';
-  var DB_VERSION = 2;
+  var DB_VERSION = 3;
   var STORE_NAME = 'profile-download-state';
   var MAX_STORED_PROFILE_STATES = 30;
   var PROFILE_STATE_TTL_MS = 90 * 24 * 60 * 60 * 1e3;
   var dbPromise = null;
   var PUSH_STORE_NAME = 'push-records';
-  var MAX_PUSH_RECORDS = 5000;
+  var PUSH_INDEX_NAME = 'by-pushedAt';
+  // 推送记录默认上限；设置里可改（见 PUSH_CAP_OPTIONS），0 = 不限
+  var PUSH_CAP_DEFAULT = 50000;
+  var PUSH_CAP_OPTIONS = [5000, 20000, 50000, 0];
+  // 记录里保存的作品名截断长度（完整名字在 Eagle 素材里，记录只为徽标提示）
+  var PUSH_NAME_MAX = 60;
   var PUSH_RECORD_TTL_MS = 365 * 24 * 60 * 60 * 1e3;
   // 0 = 不过期
   function getProfileStateDB() {
@@ -10863,11 +10891,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
                 keyPath: 'profileKey'
               });
             }
+            let pushStore = null;
             if (!db.objectStoreNames.contains(PUSH_STORE_NAME)) {
-              const pushStore = db.createObjectStore(PUSH_STORE_NAME, {
+              pushStore = db.createObjectStore(PUSH_STORE_NAME, {
                 keyPath: 'key'
               });
-              pushStore.createIndex('by-pushedAt', 'pushedAt');
+            } else if (request.transaction) {
+              // v2 → v3：老库已经有 store，只需要补 pushedAt 索引（清理时按时间游标淘汰）
+              pushStore = request.transaction.objectStore(PUSH_STORE_NAME);
+            }
+            if (pushStore) {
+              try {
+                if (!pushStore.indexNames || !pushStore.indexNames.contains(PUSH_INDEX_NAME)) {
+                  pushStore.createIndex(PUSH_INDEX_NAME, 'pushedAt');
+                }
+              } catch (err) {
+                console.warn('[dy-dl] 推送记录索引创建失败（清理会退回全量扫描）', err);
+              }
             }
           };
           request.onsuccess = () => resolve(request.result);
@@ -10911,53 +10951,176 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     try {
       const f = (Config && Config.global && Config.global.features) || {};
       const e = (f.downloader_config && f.downloader_config.eagle) || {};
+      const rawCap = Number(e.push_record_cap);
       return {
         history: e.push_history !== false,
         badge: e.push_badge !== false,
-        forever: e.push_record_forever === true
+        forever: e.push_record_forever === true,
+        // 记录条数上限：0 = 不限；没配置时用默认 50000
+        cap: Number.isFinite(rawCap) && rawCap >= 0 ? rawCap : PUSH_CAP_DEFAULT
       };
     } catch (err) {
       return {
         history: true,
         badge: true,
-        forever: false
+        forever: false,
+        cap: PUSH_CAP_DEFAULT
       };
     }
   }
-  var pushCache = null;
+  var pushIndex = null;
   var pushWriteCount = 0;
+
+  /** 作品页地址（只在导出时补齐；存储里不再保存，省空间） */
+  function pushPageUrlOf(awemeId) {
+    return awemeId ? 'https://www.douyin.com/video/' + awemeId : '';
+  }
+
+  /** 内存索引项：只保留徽标与 tooltip 需要的字段，比整条记录小 3-4 倍 */
+  function toPushIndexEntry(row) {
+    if (!row || !row.awemeId) return null;
+    return {
+      awemeId: String(row.awemeId),
+      pushedAt: row.pushedAt || 0,
+      pushCount: row.pushCount || 0,
+      name: row.name || '',
+      folderName: row.folderName || ''
+    };
+  }
+
+  /** 落盘记录：去掉 pageUrl / apiStyle / itemIds，作品名截断，约 150 字节/条 */
+  function toStoredPushRecord(rec) {
+    return {
+      key: rec.key,
+      platform: rec.platform || 'douyin',
+      awemeId: String(rec.awemeId),
+      pushedAt: rec.pushedAt || 0,
+      pushCount: rec.pushCount || 0,
+      lastBatchId: rec.lastBatchId || '',
+      folderId: rec.folderId || '',
+      folderName: rec.folderName || '',
+      name: String(rec.name || '').slice(0, PUSH_NAME_MAX),
+      mediaType: rec.mediaType || '',
+      mediaCount: rec.mediaCount || 1,
+      tags: Array.isArray(rec.tags) ? rec.tags.slice(0, 20) : [],
+      updatedAt: rec.updatedAt || Date.now()
+    };
+  }
+
+  /** 遍历推送记录：有游标就流式读（大库也不会一次性铺满内存），没有就退回 getAll */
+  function iteratePushRows(store, onRow) {
+    return new Promise((resolve, reject) => {
+      let req = null;
+      try {
+        req = typeof store.openCursor === 'function' ? store.openCursor() : null;
+      } catch (err) {
+        req = null;
+      }
+      if (!req) {
+        let allReq = null;
+        try {
+          allReq = store.getAll();
+        } catch (err) {
+          resolve();
+          return;
+        }
+        allReq.onsuccess = () => {
+          try {
+            const rows = allReq.result || [];
+            for (let i = 0; i < rows.length; i += 1) onRow(rows[i], null);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        allReq.onerror = () => reject(allReq.error);
+        return;
+      }
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        try {
+          onRow(cursor.value, cursor);
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   // ─── src/handlers/douyin/push-history.ts · Eagle 推送记录 ──────────
   class PushHistory {
     static _key(awemeId, platform) {
       return `${platform || 'douyin'}:${awemeId}`;
     }
-    /** 打开 DB 并把全部记录预热进内存（卡片渲染需要同步判断） */
-    static async init() {
-      if (pushCache) return pushCache;
-      pushCache = new Map();
-      try {
-        const db = await getProfileStateDB();
-        const rows = await requestResult(
-          db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME).getAll()
-        );
-        for (const row of rows) {
-          if (row && row.awemeId) pushCache.set(String(row.awemeId), row);
+    /** 打开 DB 并把记录投影成轻量索引（卡片渲染需要同步判断是否已推送） */
+    static init() {
+      // 加载进行中（页面启动就会调一次）时复用同一个 promise，避免第二个调用拿到空索引
+      if (PushHistory._initPromise) return PushHistory._initPromise;
+      if (pushIndex) return Promise.resolve(pushIndex);
+      pushIndex = new Map();
+      PushHistory._initPromise = (async () => {
+        try {
+          const db = await getProfileStateDB();
+          const store = db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME);
+          await iteratePushRows(store, (row) => {
+            const entry = toPushIndexEntry(row);
+            if (entry) pushIndex.set(entry.awemeId, entry);
+          });
+          console.debug('[dy-dl] 推送记录已加载：', pushIndex.size);
+        } catch (err) {
+          // 加载失败就把索引清掉，下次调用会重试；期间只是不显示「已推送」标记
+          pushIndex = null;
+          console.warn('[dy-dl] 推送记录加载失败（降级：不显示「已推送」标记）', err);
+          return null;
+        } finally {
+          PushHistory._initPromise = null;
         }
-        console.debug('[dy-dl] 推送记录已加载：', pushCache.size);
-      } catch (err) {
-        console.warn('[dy-dl] 推送记录加载失败（降级：不显示「已推送」标记）', err);
-      }
-      return pushCache;
+        return pushIndex;
+      })();
+      return PushHistory._initPromise;
     }
     static get(awemeId) {
-      if (!pushCache || !awemeId) return null;
-      return pushCache.get(String(awemeId)) || null;
+      if (!pushIndex || !awemeId) return null;
+      return pushIndex.get(String(awemeId)) || null;
     }
     static has(awemeId) {
       return !!PushHistory.get(awemeId);
     }
     static count() {
-      return pushCache ? pushCache.size : 0;
+      return pushIndex ? pushIndex.size : 0;
+    }
+    /** 读库里的一条完整记录（合并 pushCount / 文件夹信息用；索引里没有这些） */
+    static async _readStored(awemeId) {
+      try {
+        const db = await getProfileStateDB();
+        const store = db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME);
+        if (typeof store.get !== 'function') return null;
+        const row = await requestResult(store.get(PushHistory._key(awemeId)));
+        return row || null;
+      } catch (err) {
+        return null;
+      }
+    }
+    /** 读库里全部完整记录（导出 / 导入合并用） */
+    static async _readAll() {
+      const rows = [];
+      try {
+        const db = await getProfileStateDB();
+        const store = db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME);
+        await iteratePushRows(store, (row) => {
+          if (row && row.awemeId) rows.push(row);
+        });
+      } catch (err) {
+        console.warn('[dy-dl] 读取全部推送记录失败', err);
+      }
+      return rows;
     }
     /** 从一条 Eagle 素材反推抖音作品 id（素材的 url 字段存的就是作品页地址） */
     static _awemeIdFromItem(item) {
@@ -11039,7 +11202,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         }
         offset += items.length;
         if (items.length < LIMIT) break;
-        if (offset >= 50000) break; // 安全上限
+        if (offset >= 200000) break; // 安全上限（约 1000 页）
       }
       return {
         scanned,
@@ -11048,59 +11211,61 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       };
     }
 
-    /** 导出用的数据结构 */
-    static exportData() {
+    /** 导出用的数据结构（完整记录 + 补齐 pageUrl） */
+    static async exportData() {
+      const rows = await PushHistory._readAll();
       return {
         format: 'douyin-push-records',
-        version: 1,
+        version: 2,
         exportedAt: Date.now(),
-        records: PushHistory.list()
+        records: rows.map((row) => Object.assign({}, row, { pageUrl: pushPageUrlOf(row.awemeId) }))
       };
     }
 
     /** 合并导入：同一条记录取更大的 pushCount 与更晚的 pushedAt */
     static async importRecords(list) {
       const arr = Array.isArray(list) ? list : [];
+      if (!arr.length) return 0;
+      await PushHistory.init();
+      const existing = new Map();
+      for (const row of await PushHistory._readAll()) existing.set(String(row.awemeId), row);
+      const db = await getProfileStateDB();
+      const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
+      const store = tx.objectStore(PUSH_STORE_NAME);
       let n = 0;
       for (const raw of arr) {
         try {
           const awemeId = raw && raw.awemeId ? String(raw.awemeId) : '';
           if (!awemeId) continue;
-          await PushHistory.init();
-          if (!pushCache) continue;
-          const prev = pushCache.get(awemeId) || null;
-          const rec = {
+          const prev = existing.get(awemeId) || null;
+          const stored = toStoredPushRecord({
             key: PushHistory._key(awemeId),
             platform: 'douyin',
             awemeId,
             pushedAt: Math.max(prev ? prev.pushedAt || 0 : 0, raw.pushedAt || 0),
             pushCount: Math.max(prev ? prev.pushCount || 0 : 0, raw.pushCount || 0),
+            lastBatchId: (prev && prev.lastBatchId) || '',
             folderId: raw.folderId || (prev && prev.folderId) || '',
             folderName: raw.folderName || (prev && prev.folderName) || '',
             tags: Array.isArray(raw.tags) ? raw.tags.slice() : (prev && prev.tags) || [],
             name: raw.name || (prev && prev.name) || '',
             mediaType: raw.mediaType || (prev && prev.mediaType) || '',
             mediaCount: raw.mediaCount || (prev && prev.mediaCount) || 1,
-            pageUrl: raw.pageUrl || (prev && prev.pageUrl) || '',
-            apiStyle: raw.apiStyle || (prev && prev.apiStyle) || '',
-            itemIds: Array.isArray(raw.itemIds) ? raw.itemIds.slice() : (prev && prev.itemIds) || [],
-            lastBatchId: (prev && prev.lastBatchId) || '',
             updatedAt: Date.now()
-          };
-          pushCache.set(awemeId, rec);
-          const db = await getProfileStateDB();
-          const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
-          tx.objectStore(PUSH_STORE_NAME).put(rec);
-          await transactionComplete(tx);
+          });
+          store.put(stored);
+          if (pushIndex) pushIndex.set(awemeId, toPushIndexEntry(stored));
           n += 1;
         } catch (err) {
           console.warn('[dy-dl] 导入单条记录失败', err);
         }
       }
+      await transactionComplete(tx);
+      await PushHistory.prune().catch(() => {});
       return n;
     }
 
-    /** 直接从 IndexedDB 数条数（绕过内存缓存）—— 用来确认记录是否真的落盘 */
+    /** 直接从 IndexedDB 数条数（绕过内存索引）—— 用来确认记录是否真的落盘 */
     static async diskCount() {
       try {
         const db = await getProfileStateDB();
@@ -11111,9 +11276,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         return -1;
       }
     }
+    /** 列表（默认按推送时间倒序）—— 返回内存索引里的轻量记录 */
     static list() {
-      if (!pushCache) return [];
-      return Array.from(pushCache.values()).sort((a, b) => (b.pushedAt || 0) - (a.pushedAt || 0));
+      if (!pushIndex) return [];
+      return Array.from(pushIndex.values()).sort((a, b) => (b.pushedAt || 0) - (a.pushedAt || 0));
     }
     static stats() {
       const all = PushHistory.list();
@@ -11136,11 +11302,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
           return null;
         }
         await PushHistory.init();
-        if (!pushCache) return null;
-        const prev = pushCache.get(awemeId) || null;
+        if (!pushIndex) return null;
+        const prev = await PushHistory._readStored(awemeId);
         const now = Date.now();
         const imageCount = Array.isArray(media && media.images) ? media.images.length : 0;
-        const rec = {
+        const stored = toStoredPushRecord({
           key: PushHistory._key(awemeId),
           platform: 'douyin',
           awemeId,
@@ -11155,23 +11321,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
           name: ctx.name || (prev && prev.name) || '',
           mediaType: mediaType || (prev && prev.mediaType) || '',
           mediaCount: imageCount || (prev && prev.mediaCount) || 1,
-          pageUrl:
-            ctx.website || (media && media.shareInfo && media.shareInfo.shareUrl) || (prev && prev.pageUrl) || '',
-          apiStyle: (prev && prev.apiStyle) || '',
-          itemIds: (prev && prev.itemIds) || [],
           updatedAt: now
-        };
-        pushCache.set(awemeId, rec);
+        });
+        pushIndex.set(awemeId, toPushIndexEntry(stored));
         const db = await getProfileStateDB();
         const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
-        tx.objectStore(PUSH_STORE_NAME).put(rec);
+        tx.objectStore(PUSH_STORE_NAME).put(stored);
         await transactionComplete(tx);
         pushWriteCount += 1;
         if (pushWriteCount >= 50) {
           pushWriteCount = 0;
           PushHistory.prune().catch(() => {});
         }
-        return rec;
+        return stored;
       } catch (err) {
         console.warn('[dy-dl] 推送记录写入失败（不影响推送本身）', err);
         return null;
@@ -11181,7 +11343,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       try {
         await PushHistory.init();
         const id = String(awemeId);
-        if (pushCache) pushCache.delete(id);
+        if (pushIndex) pushIndex.delete(id);
         const db = await getProfileStateDB();
         const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
         tx.objectStore(PUSH_STORE_NAME).delete(PushHistory._key(id));
@@ -11199,49 +11361,140 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
         tx.objectStore(PUSH_STORE_NAME).clear();
         await transactionComplete(tx);
-        if (pushCache) pushCache.clear();
+        if (pushIndex) pushIndex.clear();
         return true;
       } catch (err) {
         console.warn('[dy-dl] 清空推送记录失败', err);
         return false;
       }
     }
-    /** 按 条数上限 + TTL 淘汰（已定：5000 条 / 365 天） */
+    /**
+     * 按「条数上限 + TTL」淘汰最老的记录。
+     * 有 pushedAt 索引时用游标只读/删需要的那一段（O(删除数)），
+     * 没有索引（老浏览器 / 测试桩）先只读扫一遍算出要删的，再用独立事务删。
+     */
     static async prune() {
       try {
         await PushHistory.init();
-        if (!pushCache) return 0;
-        const forever = readPushCfg().forever;
-        const cutoff = !forever && PUSH_RECORD_TTL_MS > 0 ? Date.now() - PUSH_RECORD_TTL_MS : 0;
-        const all = PushHistory.list();
-        const drop = [];
-        for (let i = 0; i < all.length; i += 1) {
-          const rec = all[i];
-          if (i >= MAX_PUSH_RECORDS || (cutoff && (rec.pushedAt || 0) < cutoff)) drop.push(rec.awemeId);
-        }
-        if (!drop.length) return 0;
+        if (!pushIndex) return 0;
+        const cfg = readPushCfg();
+        const cap = Number.isFinite(Number(cfg.cap)) && Number(cfg.cap) >= 0 ? Number(cfg.cap) : PUSH_CAP_DEFAULT;
+        const cutoff = !cfg.forever && PUSH_RECORD_TTL_MS > 0 ? Date.now() - PUSH_RECORD_TTL_MS : 0;
+        if (!cap && !cutoff) return 0;
+        let total = await PushHistory.diskCount();
+        if (!(total >= 0)) total = pushIndex.size;
+        const overBy = cap > 0 && total > cap ? total - cap : 0;
+        if (!overBy && !cutoff) return 0;
         const db = await getProfileStateDB();
-        const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
-        const store = tx.objectStore(PUSH_STORE_NAME);
-        for (const id of drop) {
-          store.delete(PushHistory._key(id));
-          pushCache.delete(String(id));
+
+        // 1) 探测 pushedAt 索引是否可用（可用就走游标，不全量读）
+        let canCursor = false;
+        try {
+          const probe = db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME);
+          const idx = typeof probe.index === 'function' ? probe.index(PUSH_INDEX_NAME) : null;
+          canCursor = !!(idx && typeof idx.openCursor === 'function');
+        } catch (err) {
+          canCursor = false;
         }
-        await transactionComplete(tx);
-        console.debug('[dy-dl] 推送记录已清理：', drop.length);
-        return drop.length;
+
+        const removed = [];
+        if (!canCursor) {
+          // 2) 兜底：只读扫一遍 → 按时间升序算要删的 → 一个事务删掉
+          const rows = [];
+          const readStore = db.transaction(PUSH_STORE_NAME, 'readonly').objectStore(PUSH_STORE_NAME);
+          await iteratePushRows(readStore, (row) => {
+            if (row && row.awemeId) rows.push(row);
+          });
+          rows.sort((a, b) => (a.pushedAt || 0) - (b.pushedAt || 0));
+          const dropKeys = [];
+          for (let i = 0; i < rows.length; i += 1) {
+            const row = rows[i];
+            const tooOld = cutoff > 0 && (row.pushedAt || 0) < cutoff;
+            if (i < overBy || tooOld) {
+              removed.push(String(row.awemeId));
+              dropKeys.push(row.key || PushHistory._key(row.awemeId));
+            }
+          }
+          if (dropKeys.length) {
+            const wtx = db.transaction(PUSH_STORE_NAME, 'readwrite');
+            const wstore = wtx.objectStore(PUSH_STORE_NAME);
+            for (const k of dropKeys) wstore.delete(k);
+            await transactionComplete(wtx);
+          }
+          for (const id of removed) pushIndex.delete(id);
+          if (removed.length) console.debug('[dy-dl] 推送记录已清理（全量扫描）：', removed.length);
+          return removed.length;
+        }
+
+        // 3) 索引游标：按 pushedAt 升序，最老的在最前，删够就停
+        const tx = db.transaction(PUSH_STORE_NAME, 'readwrite');
+        // 先挂 oncomplete，游标跑完时事务可能已经提交，晚挂会永远等不到
+        const txDone = transactionComplete(tx).catch(() => {});
+        const store = tx.objectStore(PUSH_STORE_NAME);
+        const source = store.index(PUSH_INDEX_NAME);
+        await new Promise((resolve) => {
+          let req = null;
+          try {
+            req = source.openCursor();
+          } catch (err) {
+            req = null;
+          }
+          if (!req) {
+            resolve();
+            return;
+          }
+          let pos = 0;
+          req.onsuccess = () => {
+            const cursor = req.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const row = cursor.value || {};
+            const pushedAt = typeof row.pushedAt === 'number' ? row.pushedAt : 0;
+            const overCap = pos < overBy;
+            const tooOld = cutoff > 0 && pushedAt < cutoff;
+            const at = pos;
+            pos += 1;
+            if (overCap || tooOld) {
+              removed.push(String(row.awemeId || ''));
+              try {
+                cursor.delete();
+              } catch (err) {
+                try {
+                  store.delete(cursor.primaryKey);
+                } catch (err2) {}
+              }
+            }
+            // 越过超限部分、且已进入 TTL 有效期 → 后面的都更新，可以停
+            const enough = cutoff > 0 ? at >= overBy && pushedAt >= cutoff : at + 1 >= overBy;
+            if (enough) {
+              resolve();
+              return;
+            }
+            cursor.continue();
+          };
+          req.onerror = () => resolve();
+        });
+        await txDone;
+        for (const id of removed) pushIndex.delete(id);
+        if (!removed.length) return 0;
+        console.debug('[dy-dl] 推送记录已清理：', removed.length);
+        return removed.length;
       } catch (err) {
         console.warn('[dy-dl] 推送记录清理失败', err);
         return 0;
       }
     }
   }
+
   var dyPushApi = {
-    version: '1',
+    version: '2',
     list: () => PushHistory.list(),
     get: (id) => PushHistory.get(id),
     has: (id) => PushHistory.has(id),
     count: () => PushHistory.count(),
+    cfg: () => readPushCfg(),
     diskCount: () => PushHistory.diskCount(),
     rebuildFromEagle: () => PushHistory.rebuildFromEagle(),
     exportData: () => PushHistory.exportData(),

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.1.2
+// @version         2.1.3
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -7932,8 +7932,69 @@ return (${body})`
       this.current_media = null;
       this.dispose_player_events = null;
       this.downloading = false;
+      this._mediaWatchBound = false;
       this.downloader = downloader2;
       this.download_current_media = this._lock_download(this._download_current_media_logic.bind(this));
+    }
+    /** 详情页地址里的作品 id（滚动切换作品时抖音会同步改地址；主页弹层是 ?modal_id=） */
+    static urlAwemeId() {
+      const m = String(location.pathname || '').match(/\/(?:video|note)\/(\d{6,})/);
+      if (m) return m[1];
+      const modal = String(location.search || '').match(/[?&]modal_id=(\d{6,})/);
+      return modal ? modal[1] : '';
+    }
+    /** 立刻从播放器读一次作品数据（1 秒轮询之外的兜底） */
+    _read_live_media() {
+      try {
+        return readPlayerMedia(getDouyinPlayer() || this.player) || null;
+      } catch (err) {
+        return null;
+      }
+    }
+    /**
+     * 取「当前正在看的作品」。
+     *
+     * 抖音是单页应用：滚到下一个作品后，播放器/轮询可能还停在上一件，
+     * 热键这时直接用手里的 current_media 就会把上一件再推一次（Eagle 只会提示图片重复）。
+     * 这里按下时重新读一次播放器，并与地址栏里的作品 id 对齐；对不齐宁可让用户等 1 秒重按。
+     */
+    async resolve_current_media(timeout = 2e3) {
+      const expected = MediaHandler.urlAwemeId();
+      const deadline = Date.now() + timeout;
+      const idOf = (m) => String((m && m.awemeId) || '');
+      let media = this._read_live_media() || this.current_media;
+      while (Date.now() < deadline) {
+        const id = idOf(media);
+        if (!expected || !id || id === expected) break;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const next = this._read_live_media();
+        if (next) media = next;
+      }
+      const id = idOf(media);
+      if (expected && id && id !== expected) {
+        return { media, stale: true, expected };
+      }
+      if (media) this.current_media = media;
+      return { media, stale: false, expected };
+    }
+    /** 滚动 / 新视频开始播放时立刻重读作品数据，缩短「读到上一件」的时间窗 */
+    _watch_media_switch() {
+      if (this._mediaWatchBound) return;
+      this._mediaWatchBound = true;
+      let timer = 0;
+      const schedule = () => {
+        if (timer) return;
+        timer = setTimeout(() => {
+          timer = 0;
+          const media = this._read_live_media();
+          if (media) this.current_media = media;
+        }, 150);
+      };
+      try {
+        document.addEventListener('scroll', schedule, { capture: true, passive: true });
+        document.addEventListener('play', schedule, true);
+        document.addEventListener('loadedmetadata', schedule, true);
+      } catch (err) {}
     }
     static toShortId(bigintStr) {
       try {
@@ -8372,7 +8433,12 @@ return (${body})`
       };
     }
     async _download_current_media_logic() {
-      return this._download_media_logic(this.current_media, {
+      const { media, stale } = await this.resolve_current_media();
+      if (stale) {
+        alert('[dy-dl] 作品还在切换，请等 1 秒再试');
+        return;
+      }
+      return this._download_media_logic(media, {
         toastTarget: document.querySelector('.dy-dl-video-btn'),
         alertOnFail: true,
         addHistory: true
@@ -8384,14 +8450,22 @@ return (${body})`
      * 反馈用底部居中的大号提示，作品详情页（含全屏播放器）里也一定看得见；
      * 没有读到作品数据时同样给提示，而不是静默失败。
      */
-    async push_current_to_eagle() {
-      if (!this.current_media) {
+    async push_current_to_eagle(timeout) {
+      const { media, stale } = await this.resolve_current_media(timeout);
+      if (stale) {
+        createEaglePushToast().update('⚠️ 作品还在切换，等 1 秒再按一次快捷键', EAGLE_PUSH_TOAST_MS);
+        return {
+          ok: false,
+          error_msg: '作品切换中，请稍后再试'
+        };
+      }
+      if (!media) {
         createEaglePushToast().update('❌ 没读到作品数据：请先播放当前作品，或刷新页面后重试', EAGLE_PUSH_TOAST_MS);
         return {
           ok: false
         };
       }
-      return this._download_media_logic(this.current_media, {
+      return this._download_media_logic(media, {
         toastTarget: document.querySelector('.dy-dl-video-btn'),
         alertOnFail: true,
         addHistory: false,
@@ -8461,6 +8535,7 @@ return (${body})`
       }
     }
     init() {
+      this._watch_media_switch();
       this._start_detect_player_change();
     }
   }
@@ -11589,7 +11664,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     resolveAuthorFolder: (name, parentId = '', batchKey = '') =>
       getEagleClient({
         baseURL: Config.global.features.downloader_config?.eagle?.base_url
-      }).resolveAuthorFolder(name, parentId, batchKey)
+      }).resolveAuthorFolder(name, parentId, batchKey),
+    /** 调试用：查当前详情页解析到的作品（排查「推送成上一个作品」） */
+    resolveCurrentMedia: (timeout) => mediaHandler.resolve_current_media(timeout),
+    currentMedia: () => mediaHandler.current_media,
+    pushCurrent: (timeout) => mediaHandler.push_current_to_eagle(timeout)
   };
   // 注意：脚本声明了 @grant，Tampermonkey 会把它放进沙箱运行 —— 此时脚本里的 window
   // 是「沙箱的 window」，页面控制台看不到挂在它上面的属性。所以额外挂到：

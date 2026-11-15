@@ -192,7 +192,7 @@ function makeBlockedIDB() {
 
 /** 最小的 Eagle 本地 API 假服务：只用 v1 路由（v2 app info 直接 404 让脚本回退 v1） */
 function makeFakeEagle() {
-  const state = { folders: [], created: [], listCalls: 0 };
+  const state = { folders: [], created: [], listCalls: 0, addCalls: 0 };
   const gm = (opts) => {
     const url = String(opts.url || '');
     let status = 200;
@@ -210,6 +210,9 @@ function makeFakeEagle() {
       const name = String(body.folderName || '');
       state.created.push(name);
       payload = { status: 'success', data: { id: 'new-' + state.created.length } };
+    } else if (url.includes('/api/item/addFromURL')) {
+      state.addCalls += 1;
+      payload = { status: 'success', data: true };
     } else {
       status = 404;
       payload = { status: 'error', message: 'not found' };
@@ -391,6 +394,54 @@ test('文件夹改名 / 被删除后按名字重新解析，不会把作品丢�
   assert.ok(state.listCalls >= 4, '每个新批次都应重新拉取文件夹树');
 });
 
+test('详情页滚到下一个作品后，解析出的作品与地址栏对齐（不会重推上一个）', async () => {
+  const { state, gm } = makeFakeEagle();
+  const sb = runUserscript({ gm });
+  const staleMedia = { awemeId: '7300000000000000001', desc: '作品1', video: {} };
+  const freshMedia = { awemeId: '7301234567890123456', desc: '作品2', images: [{}] };
+  // 前两次读播放器还是旧作品（模拟刚滚过去、播放器状态还没跟上）
+  let reads = 0;
+  const box = { value: freshMedia };
+  const player = {};
+  Object.defineProperty(player, 'config', {
+    get() {
+      reads += 1;
+      return { awemeInfo: reads <= 2 ? staleMedia : box.value };
+    },
+  });
+  sb.player = player;
+  // 让 resolve 里的等待立即推进（默认 stub 的 setTimeout 不回调会一直挂着）
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  const r = await sb.__dyPush.resolveCurrentMedia(300);
+  assert.equal(r.stale, false, '播放器跟上之后不应判定为切换中');
+  assert.equal(String(r.media.awemeId), '7301234567890123456');
+  assert.equal(String(sb.__dyPush.currentMedia().awemeId), '7301234567890123456');
+  assert.equal(state.addCalls, 0);
+
+  // 作者主页上弹层看作品时地址是 /user/xxx?modal_id=…，也要能对上
+  const modalMedia = { awemeId: '7301234567890123999', desc: '作品3', video: {} };
+  box.value = modalMedia;
+  sb.location.pathname = '/user/MS4wLjABAAAA';
+  sb.location.search = '?modal_id=7301234567890123999';
+  const r2 = await sb.__dyPush.resolveCurrentMedia(0);
+  assert.equal(String(r2.expected), '7301234567890123999', '主页弹层要按 modal_id 取当前作品');
+  assert.equal(r2.stale, false);
+});
+
+test('作品切换中按快捷键：明确提示且不调用 Eagle（避免重复推送）', async () => {
+  const { state, gm } = makeFakeEagle();
+  const sb = runUserscript({ gm });
+  const staleMedia = { awemeId: '7300000000000000001', desc: '作品1', video: {} };
+  sb.player = { config: { awemeInfo: staleMedia } };
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  const r = await sb.__dyPush.resolveCurrentMedia(120);
+  assert.equal(r.stale, true, '地址栏是作品2、播放器还停在作品1，应判定为切换中');
+  assert.equal(String(r.expected), '7301234567890123456');
+  const pushed = await sb.__dyPush.pushCurrent(120);
+  assert.equal(pushed.ok, false, '切换中应直接拒绝推送');
+  assert.equal(state.addCalls, 0, '切换中不应调用 Eagle 写入（否则会重复推送上一个作品）');
+});
+
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -549,6 +600,10 @@ test('源码关键片段完整性（防止补丁误删既有代码）', () => {
     ['pushedAt 索引创建（清理按时间游标）', "pushStore.createIndex(PUSH_INDEX_NAME, 'pushedAt');"],
     ['设置项：记录上限下拉', '记录上限'],
     ['导出补齐作品页地址', 'pageUrl: pushPageUrlOf(row.awemeId)'],
+    ['当前作品解析（与地址栏对齐，防重推上一件）', 'async resolve_current_media(timeout = 2e3) {'],
+    ['滚动/播放时提前重读作品', '_watch_media_switch() {'],
+    ['主页弹层按 modal_id 取作品', 'modal_id=(\\d{6,})'],
+    ['切换中拒绝推送的提示', '作品还在切换，等 1 秒再按一次快捷键'],
   ];
   const missing = REQUIRED.filter(([, frag]) => !haystack.includes(flatten(frag))).map(([label]) => label);
   assert.deepEqual(missing, [], '源码缺少关键片段：' + missing.join('、'));

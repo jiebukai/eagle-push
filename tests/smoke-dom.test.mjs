@@ -192,7 +192,19 @@ function makeBlockedIDB() {
 
 /** 最小的 Eagle 本地 API 假服务：只用 v1 路由（v2 app info 直接 404 让脚本回退 v1） */
 function makeFakeEagle(options = {}) {
-  const state = { folders: [], created: [], listCalls: 0, addCalls: 0, items: [], lookupCalls: 0, addLog: [], gate: 0 };
+  const state = {
+    folders: [],
+    created: [],
+    listCalls: 0,
+    addCalls: 0,
+    items: [],
+    pending: [],
+    lookupCalls: 0,
+    addLog: [],
+    gate: 0,
+    // queueVisible=true：素材一入队就出现在列表里，但 size 还是 0（Eagle 排队阶段的真实形态）
+    queueVisible: options.queueVisible === true
+  };
   // gate > 0 时：素材要等第 gate 次 item/list 查询之后才算入库（模拟 Eagle 还在下载）
   if (typeof options.gate === 'number') state.gate = options.gate;
   const gm = (opts) => {
@@ -215,15 +227,32 @@ function makeFakeEagle(options = {}) {
     } else if (url.includes('/api/item/addFromURL')) {
       state.addCalls += 1;
       const body = JSON.parse(opts.data || '{}');
-      state.addLog.push({ name: body.name, website: body.website });
-      // 入队时先记在 pending 里，查询到足够次数后才「下载完成」进入素材库
-      state.pending = state.pending || [];
-      state.pending.push({ url: body.website, name: body.name });
+      // readyBefore：这条推送发出时，前面已经有几条真的落盘了（用于校验「等上一件下完再推下一件」）
+      state.addLog.push({
+        name: body.name,
+        website: body.website,
+        readyBefore: state.items.filter((it) => Number(it.size) > 0).length
+      });
+      if (state.queueVisible) {
+        // 排队阶段就能查到，但 size=0：脚本必须继续等 size 变成真实大小
+        const item = { url: body.website, name: body.name, size: 0 };
+        state.items.push(item);
+        state.pending.push(item);
+      } else {
+        state.pending.push({ url: body.website, name: body.name });
+      }
       payload = { status: 'success', data: true };
     } else if (url.includes('/api/item/list')) {
       state.lookupCalls += 1;
-      if (state.gate > 0 && state.lookupCalls >= state.gate && state.pending) {
-        state.items.push(...state.pending);
+      if (state.gate > 0 && state.lookupCalls >= state.gate && state.pending.length) {
+        if (state.queueVisible) {
+          // 「下载完成」：把排队中的条目补上真实大小
+          state.pending.forEach((item) => {
+            item.size = 8192;
+          });
+        } else {
+          state.items.push(...state.pending);
+        }
         state.pending = [];
       }
       payload = { status: 'success', data: state.items };
@@ -735,6 +764,37 @@ test('严格顺序关闭时不再等入库（推送更快，但 Eagle 顺序不�
   // 只有入库前的查重一次（skip_existing），不会为「等入库」反复轮询
   assert.ok(state.lookupCalls <= 1, '未开启严格顺序时不应轮询入库（实际 ' + state.lookupCalls + ' 次）');
   assert.equal(state.items.length, 0, '没等，所以此刻 Eagle 里还没有这条');
+});
+
+test('严格顺序：素材一入队就查得到、但 size 还是 0 时，不能算下完', async () => {
+  // queueVisible=true：Eagle 排队阶段就把条目列出来，size=0；gate=3 次查询后才补上真实大小
+  const { state, gm } = makeFakeEagle({ gate: 3, queueVisible: true });
+  const sb = runUserscript({ gm });
+  let virtualNow = 1700000000000;
+  sb.Date = class extends Date {
+    static now() { return (virtualNow += 1000); }
+  };
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  const downloader = sb.__dyPush.downloadManager().mediaHandler.downloader;
+  const push = (id, name) =>
+    downloader.download_one_url('https://v3-web.douyinvod.com/' + id + '.mp4', name + '.mp4', {
+      media: { awemeId: id, desc: name, video: {}, authorInfo: { nickname: '作者' } },
+      mediaType: 'video',
+      downloaderOverride: 'eagle',
+      strictOrder: true
+    });
+  assert.equal((await push('7300000000000000101', '作品A')).ok, true);
+  assert.equal((await push('7300000000000000102', '作品B')).ok, true);
+  assert.equal(state.addLog.length, 2);
+  assert.equal(
+    state.addLog[1].readyBefore,
+    1,
+    '推第二件时第一件必须已经真的落盘（不能只是「出现在列表里」）'
+  );
+  assert.ok(
+    state.items.every((it) => Number(it.size) > 0),
+    '返回时素材都应已下载完成（size 不为 0）'
+  );
 });
 
 test('源码关键片段完整性（防止补丁误删既有代码）', () => {

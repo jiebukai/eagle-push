@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.3.1
+// @version         2.3.2
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -6274,8 +6274,41 @@ return (${body})`
      * 按来源页面 URL 查询（v1 是子串匹配，必须再逐条复核 URL 与文件名）。
      */
     async findExisting(task, options = {}) {
+      return !!(await this.findExistingItem(task, options));
+    }
+    /**
+     * 从 Eagle 的查询结果里挑出同一条素材（URL 归一化 + 文件名去掉扩展名后比较）。
+     */
+    static pickItem(items, task) {
+      const norm = (u) => String(u || '').trim().replace(/[?#].*$/, '');
+      const targetUrl = norm(task?.website);
+      if (!targetUrl) return null;
+      const list = Array.isArray(items) ? items : [];
+      return (
+        list.find((item) => {
+          if (norm(item?.url) !== targetUrl) return false;
+          return EagleClient.isSameItemName(item?.name, task?.name);
+        }) || null
+      );
+    }
+    /**
+     * 素材是否已经真正落盘，而不是「刚排进下载队列」。
+     *
+     * Eagle 在排队阶段就可能把条目写进列表，此时 size 还是 0（有些版本干脆没有 size 字段）。
+     * 只有 size 明确为 0 时才视为「还没下完」，其余情况一律当作可用，避免一直空等。
+     */
+    static isItemReady(item) {
+      if (!item) return false;
+      const size = Number(item.size);
+      if (Number.isFinite(size) && size === 0) return false;
+      return true;
+    }
+    /**
+     * 找到 Eagle 里那条素材并返回条目本身（找不到返回 null）。
+     */
+    async findExistingItem(task, options = {}) {
       const website = String(task?.website || '').trim();
-      if (!website) return false;
+      if (!website) return null;
       const cacheKey = this.normalizeUrl(website) || website;
       // fresh=true 时绕过缓存：Eagle 刚入库的素材要重新问一次才能看到
       if (options.fresh) this.lookupCache.delete(cacheKey);
@@ -6288,11 +6321,7 @@ return (${body})`
         items = EagleClient.extractListData(response);
         this.lookupCache.set(cacheKey, items);
       }
-      const targetUrl = this.normalizeUrl(website);
-      return items.some((item) => {
-        if (this.normalizeUrl(item?.url || '') !== targetUrl) return false;
-        return EagleClient.isSameItemName(item?.name, task?.name);
-      });
+      return EagleClient.pickItem(items, task);
     }
 
     /**
@@ -6311,7 +6340,10 @@ return (${body})`
         attempt += 1;
         try {
           // 第一次立即问，后面按间隔重问
-          if (await client.findExisting(task, { fresh: true })) return true;
+          const item = await client.findExistingItem(task, { fresh: true });
+          // 排队阶段的条目 size 还是 0，这时不能算「已经入库」，
+          // 否则下一件会被提前推出去，入库顺序依旧由 Eagle 的并发下载决定。
+          if (EagleClient.isItemReady(item)) return true;
         } catch (err) {
           // Eagle 偶尔连不上不用中断整批，等下一轮
         }

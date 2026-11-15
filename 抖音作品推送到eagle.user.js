@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.3.2
+// @version         2.3.3
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -5061,14 +5061,14 @@ return (${body})`
                   children: [
                     jsx('input', {
                       type: 'checkbox',
-                      checked: eagleCfg.push_strict_order !== false,
+                      checked: eagleCfg.push_strict_order === true,
                       onChange: (e3) =>
                         setPushField({
                           push_strict_order: e3.target.checked
                         })
                     }),
                     jsx('span', {
-                      children: '批量推送时等上一件入库再推下一件（保证 Eagle 里的先后顺序，整体会慢一些）'
+                      children: '批量推送时等上一件入库再推下一件（入库顺序异常时再打开，会让整批变慢）'
                     })
                   ]
                 })
@@ -7160,13 +7160,20 @@ return (${body})`
     });
     return out;
   }
-  /** 连选：从 from 到 to 在 ids 里的闭区间（两端任一找不到就返回空） */
+  /**
+   * 连选：从 from 到 to 在 ids 里的闭区间（两端任一找不到就返回空）。
+   *
+   * 方向要跟着「点击方向」走：从第 3 个 Shift 点到第 1 个，顺序必须是 3、2、1，
+   * 而不是升序的 1、2、3 —— 批量推送是按选择顺序执行的，这里若按页面顺序返回，
+   * 推送顺序就会变成「从上到下」，和用户的操作顺序对不上。
+   */
   function rangeOfIds(ids, from, to) {
     const list = Array.isArray(ids) ? ids.map(String) : [];
     const a = list.indexOf(String(from));
     const b = list.indexOf(String(to));
     if (a < 0 || b < 0) return [];
-    return list.slice(Math.min(a, b), Math.max(a, b) + 1);
+    const segment = list.slice(Math.min(a, b), Math.max(a, b) + 1);
+    return b < a ? segment.reverse() : segment;
   }
   // ─── src/ui/DOMPatcher.ts · 播放器 DOM 注入点修补 ──────────────────
   var PLAYER_CONTROL_SELECTOR = '.douyin-player-controls, xg-controls';
@@ -7719,7 +7726,7 @@ return (${body})`
         if (Date.now() < (this._suppressCardClickUntil || 0)) return;
         const dm = this.profilePageHandler.downloadManager;
         const id = String(awemeId);
-        // Shift + 点选 = 从上次点的那张连选到这张（按页面顺序）
+        // Shift + 点选 = 从上次点的那张连选到这张（按点击方向，反向也保持反向）
         if (ev.shiftKey && this._lastClickedAwemeId && this._lastClickedAwemeId !== id) {
           const orderedIds = this._feedCardBoxes().map((item) => item.id);
           const segment = rangeOfIds(orderedIds, this._lastClickedAwemeId, id);
@@ -11467,8 +11474,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         forever: e.push_record_forever === true,
         // 记录条数上限：0 = 不限；没配置时用默认 50000
         cap: Number.isFinite(rawCap) && rawCap >= 0 ? rawCap : PUSH_CAP_DEFAULT,
-        // 批量推送时是否等上一件真正入库再推下一件（保证 Eagle 里的顺序）
-        strictOrder: e.push_strict_order !== false
+        // 批量推送时是否等上一件真正入库再推下一件。
+        // 默认关闭：Eagle 的下载完成顺序基本等于推送顺序，等待只会让整批变慢；
+        // 如果某些机器上出现「入库顺序和推送顺序对不上」，可以在设置里打开它兜底。
+        strictOrder: e.push_strict_order === true
       };
     } catch (err) {
       return {
@@ -11476,7 +11485,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         badge: true,
         forever: false,
         cap: PUSH_CAP_DEFAULT,
-        strictOrder: true
+        strictOrder: false
       };
     }
   }

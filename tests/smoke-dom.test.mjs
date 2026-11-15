@@ -533,9 +533,14 @@ test('作者主页批量选择：框选命中判定与选择集操作', () => {
   // 零尺寸 / 完全在框外 → 不命中
   assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 400, top: 400, width: 0, height: 0 })), []);
   assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 300, top: 300, width: 50, height: 50 })), []);
-  // 连选：区间含两端，反向也行，找不到任一端返回空
+  // 连选：区间含两端，方向跟着点击方向走，找不到任一端返回空
   assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'a', 'c')), ['a', 'b', 'c']);
-  assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'd', 'b')), ['b', 'c', 'd']);
+  assert.deepEqual(
+    Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'd', 'b')),
+    ['d', 'c', 'b'],
+    '反向连选要按点击方向返回，否则批量推送会变成从上到下'
+  );
+  assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'c', 'a')), ['c', 'b', 'a']);
   assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b'], 'a', 'zz')), []);
   // 替换 / 追加 / 减选
   sel.set(['x', 'y']);
@@ -833,7 +838,7 @@ test('源码关键片段完整性（防止补丁误删既有代码）', () => {
     ['选中顺序读取（批量任务按它执行）', 'selectionOrder() {'],
     ['Eagle 推送强制串行（保证入库顺序）', 'this._concurrency = isEagleJob ? 1 : this._normalizeConcurrency(concurrency);'],
     ['严格顺序：等待素材入库', 'static async waitUntilIndexed(client, task, options = {}) {'],
-    ['严格顺序配置项', 'strictOrder: e.push_strict_order !== false'],
+    ['严格顺序配置项', 'strictOrder: e.push_strict_order === true'],
   ];
   const missing = REQUIRED.filter(([, frag]) => !haystack.includes(flatten(frag))).map(([label]) => label);
   assert.deepEqual(missing, [], '源码缺少关键片段：' + missing.join('、'));

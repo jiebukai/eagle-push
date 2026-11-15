@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.2.0
+// @version         2.3.0
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -28,7 +28,8 @@
  *    （视频或整套图集）推送到 Eagle 素材库。
  * 2. 作者主页：右下角浮动面板新增「存 Eagle」按钮，勾选多个作品后批量推送。
  *    选中方式：直接在卡片上按住鼠标拖出选框（框住谁选谁，Shift 追加、Alt 减选）、
- *    Shift 点选区间连选、面板上的全选 / 反选。
+ *    Shift 点选区间连选、面板上的全选 / 反选。批量推送按「选中的先后顺序」执行，
+ *    并且强制串行，保证 Eagle 素材库里的添加顺序与选择顺序一致。
  * 3. 设置 → 下载器配置 → 类型选「Eagle」：填写 Eagle 服务地址
  *    （默认 http://127.0.0.1:41595）、选择目标文件夹与标签。
  *    未选择标签时，素材不会写入任何标签。
@@ -11029,7 +11030,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
                   opacity: '0.6',
                   userSelect: 'none'
                 },
-                children: '选中作品：直接拖拽框选 · Shift 点选连选 · Alt 拖拽减选'
+                children: '选中作品：直接拖拽框选 · Shift 点选连选 · Alt 拖拽减选（按选中顺序执行）'
               }),
               jsx('div', {
                 className: floatingPanelStyles.progressSection,
@@ -11931,10 +11932,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     selection: {
       count: () => profilePageHandler.downloadManager.selectedIds.size,
       ids: () => Array.from(profilePageHandler.downloadManager.selectedIds),
+      /** 批量任务实际执行的顺序（推送 / 下载都按它） */
+      order: () => profilePageHandler.downloadManager.selectionOrder(),
       set: (ids) => profilePageHandler.downloadManager.setSelection(ids),
       add: (ids) => profilePageHandler.downloadManager.markSelectMany(ids, true),
       remove: (ids) => profilePageHandler.downloadManager.markSelectMany(ids, false),
       invert: () => profilePageHandler.downloadManager.invertSelection(),
+      /** 模拟点一下卡片（单选切换），用来验证「推送顺序 = 点选顺序」 */
+      toggle: (id) => {
+        const dm = profilePageHandler.downloadManager;
+        dm.markSelect(String(id), !dm.selectedIds.has(String(id)));
+      },
       pickInRect: (cards, rect) => pickCardsInRect(cards, rect),
       rangeOfIds: (ids, from, to) => rangeOfIds(ids, from, to)
     }
@@ -12373,13 +12381,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       }
     }
     markSelect(awemeId, selected) {
-      const changed = selected ? !this.selectedIds.has(awemeId) : this.selectedIds.has(awemeId);
+      const has = this.selectedIds.has(awemeId);
+      if (selected && has) {
+        // 之前取消过又重新选中：挪到队尾，让「推送顺序 = 最后一次选择顺序」
+        this.selectedIds.delete(awemeId);
+        this.selectedIds.add(awemeId);
+        return;
+      }
       if (selected) this.selectedIds.add(awemeId);
       else this.selectedIds.delete(awemeId);
-      if (changed) {
+      if (selected || has) {
         this.emit('stateChanged', this);
         this.emit('countsUpdated', this.getCounts());
       }
+    }
+    /** 选中顺序：Set 的插入顺序，也就是用户点选 / 框选的先后 */
+    selectionOrder() {
+      return Array.from(this.selectedIds);
     }
     markSelectMany(ids, selected) {
       let changed = false;
@@ -12580,7 +12598,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       if (!resuming) this.jobLog = [];
       this.currentDownloadType = downloadType;
       this._downloaderOverride = downloaderOverride || '';
-      this._concurrency = this._normalizeConcurrency(concurrency);
+      const isEagleJob = this._downloaderOverride === 'eagle';
+      // Eagle 的入库顺序 = 推送完成顺序；并发会让顺序漂移，所以推送强制串行
+      this._concurrency = isEagleJob ? 1 : this._normalizeConcurrency(concurrency);
       this.jobRunning = true;
       this.jobStopRequested = false;
       this.jobEndRequested = false;
@@ -12592,11 +12612,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       };
       this._lastRunError = '';
       this.emit('jobStarted');
-      const isEagleJob = this._downloaderOverride === 'eagle';
       this._push_log(
         'info',
         resuming ? (isEagleJob ? '继续推送到 Eagle' : '继续下载') : isEagleJob ? '开始推送到 Eagle' : '开始下载'
       );
+      this._push_log('info', '按选中顺序逐条执行（共 ' + this.selectionOrder().length + ' 项被选中）');
       if (resuming) this.emit('jobResumed');
       this.emit('stateChanged', this);
       try {
@@ -12627,7 +12647,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         downloadType === 'cover' ? this.jobState.coverFailedItems || {} : this.jobState.failedItems || {};
       const downloadedSet = new Set(downloadedIds);
       const failedSet = new Set(Object.keys(failedItems));
-      const selectedIdsArray = Array.from(this.selectedIds);
+      const selectedIdsArray = this.selectionOrder();
       const pendingIds = selectedIdsArray.filter((id) => !downloadedSet.has(id) || failedSet.has(id));
       this._itemStatus = this._deriveItemStatuses();
       this.emit('stateChanged', this);
@@ -12644,7 +12664,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         return;
       }
       const concurrency = this._concurrency;
-      this._push_log('info', `并发数：${concurrency}`);
+      this._push_log(
+        'info',
+        this._downloaderOverride === 'eagle' ? '并发数：1（推送按选中顺序串行，保证 Eagle 入库顺序）' : `并发数：${concurrency}`
+      );
       await this._runConcurrentWorkers(pendingIds, downloadType, concurrency, this._downloaderOverride);
       if (!this.jobState) return;
       if (this.jobStopRequested) {

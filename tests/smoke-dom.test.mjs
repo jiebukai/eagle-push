@@ -472,6 +472,26 @@ test('作者主页批量选择：框选命中判定与选择集操作', () => {
   assert.equal(sel.count(), 0);
 });
 
+test('作者主页批量执行顺序：按用户选中的先后，而不是页面顺序', () => {
+  const sb = runUserscript();
+  const sel = sb.__dyPush.selection;
+  // 先点第 3 张、再点第 1 张、再点第 2 张
+  sel.toggle('p3');
+  sel.toggle('p1');
+  sel.toggle('p2');
+  assert.deepEqual(Array.from(sel.order()), ['p3', 'p1', 'p2'], '顺序应是点选先后，不是页面顺序');
+  // 取消后重新选中 → 挪到队尾（最后一次选择最后推送）
+  sel.toggle('p1');
+  assert.deepEqual(Array.from(sel.order()), ['p3', 'p2']);
+  sel.toggle('p1');
+  assert.deepEqual(Array.from(sel.order()), ['p3', 'p2', 'p1']);
+  // 框选一批：整批按卡片顺序追加在已有选择后面
+  sel.set(['p1', 'p2', 'p3', 'p4', 'p5']);
+  assert.deepEqual(Array.from(sel.order()), ['p1', 'p2', 'p3', 'p4', 'p5']);
+  sel.set([]);
+  assert.deepEqual(Array.from(sel.order()), []);
+});
+
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -640,6 +660,8 @@ test('源码关键片段完整性（防止补丁误删既有代码）', () => {
     ['框选命中高亮类名', 'dy-dl-marquee-hit'],
     ['面板「反选」按钮', "children: '反选'"],
     ['框选操作提示文案', 'Alt 拖拽减选'],
+    ['选中顺序读取（批量任务按它执行）', 'selectionOrder() {'],
+    ['Eagle 推送强制串行（保证入库顺序）', 'this._concurrency = isEagleJob ? 1 : this._normalizeConcurrency(concurrency);'],
   ];
   const missing = REQUIRED.filter(([, frag]) => !haystack.includes(flatten(frag))).map(([label]) => label);
   assert.deepEqual(missing, [], '源码缺少关键片段：' + missing.join('、'));

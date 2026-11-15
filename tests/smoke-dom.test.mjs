@@ -191,8 +191,10 @@ function makeBlockedIDB() {
 }
 
 /** 最小的 Eagle 本地 API 假服务：只用 v1 路由（v2 app info 直接 404 让脚本回退 v1） */
-function makeFakeEagle() {
-  const state = { folders: [], created: [], listCalls: 0, addCalls: 0 };
+function makeFakeEagle(options = {}) {
+  const state = { folders: [], created: [], listCalls: 0, addCalls: 0, items: [], lookupCalls: 0, addLog: [], gate: 0 };
+  // gate > 0 时：素材要等第 gate 次 item/list 查询之后才算入库（模拟 Eagle 还在下载）
+  if (typeof options.gate === 'number') state.gate = options.gate;
   const gm = (opts) => {
     const url = String(opts.url || '');
     let status = 200;
@@ -212,6 +214,20 @@ function makeFakeEagle() {
       payload = { status: 'success', data: { id: 'new-' + state.created.length } };
     } else if (url.includes('/api/item/addFromURL')) {
       state.addCalls += 1;
+      const body = JSON.parse(opts.data || '{}');
+      state.addLog.push({ name: body.name, website: body.website });
+      // 入队时先记在 pending 里，查询到足够次数后才「下载完成」进入素材库
+      state.pending = state.pending || [];
+      state.pending.push({ url: body.website, name: body.name });
+      payload = { status: 'success', data: true };
+    } else if (url.includes('/api/item/list')) {
+      state.lookupCalls += 1;
+      if (state.gate > 0 && state.lookupCalls >= state.gate && state.pending) {
+        state.items.push(...state.pending);
+        state.pending = [];
+      }
+      payload = { status: 'success', data: state.items };
+    } else if (url.includes('/api/item/addFromURL')) {
       payload = { status: 'success', data: true };
     } else {
       status = 404;
@@ -226,6 +242,25 @@ function makeFakeEagle() {
 }
 
 /* ------------------------------ 运行产物 ------------------------------ */
+class URLSearchParamsStub {
+  constructor(init) {
+    this._map = new Map();
+    const text = typeof init === 'string' ? init.replace(/^\?/, '') : '';
+    for (const pair of text.split('&')) {
+      if (!pair) continue;
+      const [k, v = ''] = pair.split('=');
+      this._map.set(decodeURIComponent(k), decodeURIComponent(v));
+    }
+  }
+  get(k) { return this._map.has(k) ? this._map.get(k) : null; }
+  getAll(k) { return this._map.has(k) ? [this._map.get(k)] : []; }
+  has(k) { return this._map.has(k); }
+  set(k, v) { this._map.set(String(k), String(v)); }
+  append(k, v) { this._map.set(String(k), String(v)); }
+  delete(k) { this._map.delete(k); }
+  toString() { return Array.from(this._map, ([k, v]) => `${k}=${v}`).join('&'); }
+}
+
 function runUserscript({ withIndexedDB = true, idb = null, ls = null, gm = null } = {}) {
   const code = readFileSync(ARTIFACT, 'utf8');
   const lsData = new Map(ls ? Object.entries(ls) : []);
@@ -264,7 +299,19 @@ function runUserscript({ withIndexedDB = true, idb = null, ls = null, gm = null 
     cancelIdleCallback: () => {},
     getComputedStyle: () => ({ position: 'static', getPropertyValue: () => '' }),
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
-    URL: { createObjectURL: () => 'blob:stub', revokeObjectURL: () => {} },
+    URL: Object.assign(
+      class {
+        constructor(raw) {
+          this.href = String(raw);
+          this.pathname = String(raw).replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+          this.search = String(raw).includes('?') ? String(raw).slice(String(raw).indexOf('?')) : '';
+          this.searchParams = new URLSearchParamsStub(this.search);
+          this.origin = '';
+        }
+      },
+      { createObjectURL: () => 'blob:stub', revokeObjectURL: () => {} }
+    ),
+    URLSearchParams: URLSearchParamsStub,
     fetch: () => Promise.reject(new Error('stub: fetch 不可用')),
     innerWidth: 1440,
     innerHeight: 900,
@@ -492,6 +539,28 @@ test('作者主页批量执行顺序：按用户选中的先后，而不是页�
   assert.deepEqual(Array.from(sel.order()), []);
 });
 
+test('批量任务真正入队的顺序：与选中顺序一致（不是页面从上到下）', async () => {
+  const sb = runUserscript();
+  // 产物里的 500ms 间隔、轮询等都靠 setTimeout，沙箱默认不执行 → 这里改成同步执行
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  sb.location.pathname = '/user/MS4wLjABAAAA';
+  sb.location.href = 'https://www.douyin.com/user/MS4wLjABAAAA';
+  sb.location.search = '';
+  const dm = sb.__dyPush.downloadManager();
+  const calls = [];
+  // 把真正的下载/推送动作替换成记录调用顺序：只验证队列顺序
+  dm._downloadOne = async (awemeId) => { calls.push(String(awemeId)); };
+  // 先让主页状态加载完成（首次加载会重置本会话状态，此时还没选东西）
+  await dm.collect();
+  const sel = sb.__dyPush.selection;
+  sel.toggle('7300000000000000003');
+  sel.toggle('7300000000000000001');
+  sel.toggle('7300000000000000005');
+  await dm.startJob('content', 1, 'eagle');
+  assert.deepEqual(calls, ['7300000000000000003', '7300000000000000001', '7300000000000000005'],
+    '批量推送应按选中先后执行，而不是按页面顺序');
+});
+
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -627,6 +696,47 @@ test('上限可配置：超限时按 pushedAt 索引游标先删最老的', asyn
   );
 });
 
+test('严格顺序：上一件还没进 Eagle 素材库时不会推下一件', async () => {
+  // gate=3：前两次查询查不到，第三次才「下载完成」——模拟 Eagle 还在排队下载
+  const { state, gm } = makeFakeEagle({ gate: 3 });
+  const sb = runUserscript({ gm });
+  // 虚拟时钟：每读一次 Date.now() 前进 1 秒，让等待循环有明确终点（不会真的空转 180 秒）
+  let virtualNow = 1700000000000;
+  sb.Date = class extends Date {
+    static now() { return (virtualNow += 1000); }
+  };
+  // 沙箱里的 setTimeout 默认不回调，等待循环会永远挂着 → 这里同步执行
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  const downloader = sb.__dyPush.downloadManager().mediaHandler.downloader;
+  const media = { awemeId: '7300000000000000001', desc: '作品1', video: {}, authorInfo: { nickname: '作者' } };
+  const res = await downloader.download_one_url('https://v3-web.douyinvod.com/x.mp4', '作品1.mp4', {
+    media,
+    mediaType: 'video',
+    downloaderOverride: 'eagle',
+    strictOrder: true
+  });
+  assert.equal(res.ok, true);
+  assert.equal(state.addCalls, 1);
+  assert.ok(state.lookupCalls >= 3, '应轮询到素材真正入库（实际 ' + state.lookupCalls + ' 次）');
+  assert.equal(state.items.length, 1, '返回时素材应已在 Eagle 里');
+});
+
+test('严格顺序关闭时不再等入库（推送更快，但 Eagle 顺序不保证）', async () => {
+  const { state, gm } = makeFakeEagle({ gate: 3 });
+  const sb = runUserscript({ gm });
+  const downloader = sb.__dyPush.downloadManager().mediaHandler.downloader;
+  const media = { awemeId: '7300000000000000002', desc: '作品2', video: {}, authorInfo: { nickname: '作者' } };
+  await downloader.download_one_url('https://v3-web.douyinvod.com/y.mp4', '作品2.mp4', {
+    media,
+    mediaType: 'video',
+    downloaderOverride: 'eagle'
+  });
+  assert.equal(state.addCalls, 1);
+  // 只有入库前的查重一次（skip_existing），不会为「等入库」反复轮询
+  assert.ok(state.lookupCalls <= 1, '未开启严格顺序时不应轮询入库（实际 ' + state.lookupCalls + ' 次）');
+  assert.equal(state.items.length, 0, '没等，所以此刻 Eagle 里还没有这条');
+});
+
 test('源码关键片段完整性（防止补丁误删既有代码）', () => {
   const code = readFileSync(ARTIFACT, 'utf8');
   // 脚本是手写源码风格，换行 / 缩进 / 引号都会随格式化变化，比对前统一压平
@@ -662,6 +772,8 @@ test('源码关键片段完整性（防止补丁误删既有代码）', () => {
     ['框选操作提示文案', 'Alt 拖拽减选'],
     ['选中顺序读取（批量任务按它执行）', 'selectionOrder() {'],
     ['Eagle 推送强制串行（保证入库顺序）', 'this._concurrency = isEagleJob ? 1 : this._normalizeConcurrency(concurrency);'],
+    ['严格顺序：等待素材入库', 'static async waitUntilIndexed(client, task, options = {}) {'],
+    ['严格顺序配置项', 'strictOrder: e.push_strict_order !== false'],
   ];
   const missing = REQUIRED.filter(([, frag]) => !haystack.includes(flatten(frag))).map(([label]) => label);
   assert.deepEqual(missing, [], '源码缺少关键片段：' + missing.join('、'));

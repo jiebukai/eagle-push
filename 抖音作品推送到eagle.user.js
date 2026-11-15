@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.3.0
+// @version         2.3.1
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -29,7 +29,10 @@
  * 2. 作者主页：右下角浮动面板新增「存 Eagle」按钮，勾选多个作品后批量推送。
  *    选中方式：直接在卡片上按住鼠标拖出选框（框住谁选谁，Shift 追加、Alt 减选）、
  *    Shift 点选区间连选、面板上的全选 / 反选。批量推送按「选中的先后顺序」执行，
- *    并且强制串行，保证 Eagle 素材库里的添加顺序与选择顺序一致。
+ *    强制串行，并默认「等上一件真正进了 Eagle 素材库再推下一件」——Eagle 的
+ *    addFromURL 只是把下载排进队列，素材的添加日期是它自己下载完成的时间，
+ *    不等就会因为 Eagle 的并发下载导致库里顺序错乱（设置里可关掉这个等待）。
+ *    批量任务的日志里会打印「推送队列 i/N」，可用来核对实际执行顺序。
  * 3. 设置 → 下载器配置 → 类型选「Eagle」：填写 Eagle 服务地址
  *    （默认 http://127.0.0.1:41595）、选择目标文件夹与标签。
  *    未选择标签时，素材不会写入任何标签。
@@ -5046,6 +5049,36 @@ return (${body})`
               children: [
                 jsx('span', {
                   className: configModalStyles.label,
+                  children: '推送顺序'
+                }),
+                jsx('label', {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: theme.spacing.sm,
+                    cursor: 'pointer'
+                  },
+                  children: [
+                    jsx('input', {
+                      type: 'checkbox',
+                      checked: eagleCfg.push_strict_order !== false,
+                      onChange: (e3) =>
+                        setPushField({
+                          push_strict_order: e3.target.checked
+                        })
+                    }),
+                    jsx('span', {
+                      children: '批量推送时等上一件入库再推下一件（保证 Eagle 里的先后顺序，整体会慢一些）'
+                    })
+                  ]
+                })
+              ]
+            }),
+            jsx('div', {
+              className: configModalStyles.row,
+              children: [
+                jsx('span', {
+                  className: configModalStyles.label,
                   children: '记录保留'
                 }),
                 jsx('label', {
@@ -6240,10 +6273,12 @@ return (${body})`
      * 判断素材是否已经在 Eagle 里：
      * 按来源页面 URL 查询（v1 是子串匹配，必须再逐条复核 URL 与文件名）。
      */
-    async findExisting(task) {
+    async findExisting(task, options = {}) {
       const website = String(task?.website || '').trim();
       if (!website) return false;
       const cacheKey = this.normalizeUrl(website) || website;
+      // fresh=true 时绕过缓存：Eagle 刚入库的素材要重新问一次才能看到
+      if (options.fresh) this.lookupCache.delete(cacheKey);
       let items = this.lookupCache.get(cacheKey);
       if (!items) {
         const response = await this.callApi('itemLookupByUrl', {
@@ -6258,6 +6293,33 @@ return (${body})`
         if (this.normalizeUrl(item?.url || '') !== targetUrl) return false;
         return EagleClient.isSameItemName(item?.name, task?.name);
       });
+    }
+
+    /**
+     * 等一件素材真正出现在 Eagle 素材库里。
+     *
+     * addFromURL / item/add 是「排队」语义：接口返回成功时 Eagle 只是把下载任务排进队列，
+     * 素材的「添加日期」是它自己下载完成的时间。批量推送如果不等上一件入库就推下一件，
+     * Eagle 的并发下载会让入库顺序和我们的推送顺序对不上。
+     */
+    static async waitUntilIndexed(client, task, options = {}) {
+      const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 120000;
+      const intervalMs = Number(options.intervalMs) > 0 ? Number(options.intervalMs) : 600;
+      const deadline = Date.now() + timeoutMs;
+      let attempt = 0;
+      while (Date.now() < deadline) {
+        attempt += 1;
+        try {
+          // 第一次立即问，后面按间隔重问
+          if (await client.findExisting(task, { fresh: true })) return true;
+        } catch (err) {
+          // Eagle 偶尔连不上不用中断整批，等下一轮
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+      console.warn('[dy-dl] 等待 Eagle 入库超时（' + attempt + ' 次），继续下一件');
+      return false;
     }
 
     /**
@@ -6664,6 +6726,10 @@ return (${body})`
           annotation,
           headers: config.send_referer ? EagleClient.buildDownloadHeaders(preferredUrl) : void 0
         });
+        if (options.strictOrder) {
+          // 顺序优先：等这一件真的进了素材库再推下一件，否则 Eagle 的并发下载会让顺序错乱
+          await EagleClient.waitUntilIndexed(client, { name, website });
+        }
         await PushHistory.record(media, options.mediaType, {
           config,
           name,
@@ -8555,7 +8621,8 @@ return (${body})`
               silent: !alertOnFail || isEaglePush,
               media,
               mediaType: job.type,
-              downloaderOverride
+              downloaderOverride,
+              strictOrder: options.strictOrder === true
             });
             if (dl.ok) {
               if (dl.skipped) skippedCount++;
@@ -8603,7 +8670,8 @@ return (${body})`
           silent: !alertOnFail || isEaglePush,
           media,
           mediaType: 'video',
-          downloaderOverride
+          downloaderOverride,
+          strictOrder: options.strictOrder === true
         });
         if (dl.ok && addHistory) DownloadHistory.add(media);
         if (dl.ok) {
@@ -11366,14 +11434,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
         badge: e.push_badge !== false,
         forever: e.push_record_forever === true,
         // 记录条数上限：0 = 不限；没配置时用默认 50000
-        cap: Number.isFinite(rawCap) && rawCap >= 0 ? rawCap : PUSH_CAP_DEFAULT
+        cap: Number.isFinite(rawCap) && rawCap >= 0 ? rawCap : PUSH_CAP_DEFAULT,
+        // 批量推送时是否等上一件真正入库再推下一件（保证 Eagle 里的顺序）
+        strictOrder: e.push_strict_order !== false
       };
     } catch (err) {
       return {
         history: true,
         badge: true,
         forever: false,
-        cap: PUSH_CAP_DEFAULT
+        cap: PUSH_CAP_DEFAULT,
+        strictOrder: true
       };
     }
   }
@@ -11928,6 +11999,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     resolveCurrentMedia: (timeout) => mediaHandler.resolve_current_media(timeout),
     currentMedia: () => mediaHandler.current_media,
     pushCurrent: (timeout) => mediaHandler.push_current_to_eagle(timeout),
+    /** 调试用：批量任务管理器本体（可查看 / 干预队列，一般不用） */
+    downloadManager: () => profilePageHandler.downloadManager,
     /** 调试用：作者主页批量选择（框选 / 连选）的状态与纯函数 */
     selection: {
       count: () => profilePageHandler.downloadManager.selectedIds.size,
@@ -12726,7 +12799,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
               toastPrefix: '批量下载',
               alertOnFail: false,
               addHistory: true,
-              downloaderOverride
+              downloaderOverride,
+              // 顺序优先：等这一件真的进了 Eagle 素材库再推下一件
+              strictOrder: isEaglePush && readPushCfg().strictOrder
             });
       const reason = result?.reason || (downloadType === 'cover' ? 'cover_download_failed' : 'download_failed');
       const errorMessage = result?.message || result?.error_msg || reason;
@@ -12760,11 +12835,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     }
     async _runConcurrentWorkers(pendingIds, downloadType, concurrency, downloaderOverride = '') {
       let cursor = 0;
+      const total = pendingIds.length;
+      const label = downloaderOverride === 'eagle' ? '推送' : '下载';
       const worker = async () => {
         while (!this.jobStopRequested) {
           const index = cursor++;
           if (index >= pendingIds.length) return;
           const awemeId = pendingIds[index];
+          // 打一行队列位置，方便核对执行顺序是否与选中顺序一致
+          this._push_log('info', `${label}队列 ${index + 1}/${total}`, this.dataService.feedMediaCache.get(awemeId));
           try {
             await this._downloadOne(awemeId, downloadType, downloaderOverride);
           } catch (error) {

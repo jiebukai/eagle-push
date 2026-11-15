@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.1.3
+// @version         2.2.0
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -27,6 +27,8 @@
  * 1. 作品详情页：播放器「插件」菜单里多了「存到 Eagle」，一键把当前作品
  *    （视频或整套图集）推送到 Eagle 素材库。
  * 2. 作者主页：右下角浮动面板新增「存 Eagle」按钮，勾选多个作品后批量推送。
+ *    选中方式：直接在卡片上按住鼠标拖出选框（框住谁选谁，Shift 追加、Alt 减选）、
+ *    Shift 点选区间连选、面板上的全选 / 反选。
  * 3. 设置 → 下载器配置 → 类型选「Eagle」：填写 Eagle 服务地址
  *    （默认 http://127.0.0.1:41595）、选择目标文件夹与标签。
  *    未选择标签时，素材不会写入任何标签。
@@ -7021,6 +7023,52 @@ return (${body})`
     if (duration) lines.push(`时长: ${duration}`);
     return lines;
   }
+  // ─── src/utils/selection.ts · 批量选择（框选 / 连选） ────────────────
+  /** 读元素在视口里的矩形（拿不到布局信息时返回 0 尺寸，保证不抛错） */
+  function readClientRect(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      return {
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height
+      };
+    } catch (err) {
+      return {left: 0, top: 0, width: 0, height: 0};
+    }
+  }
+  /** 两个矩形是否相交（视口坐标系；零尺寸矩形不参与命中） */
+  function rectsIntersect(a, b) {
+    if (!a || !b) return false;
+    const aw = Number(a.width) || 0;
+    const ah = Number(a.height) || 0;
+    const bw = Number(b.width) || 0;
+    const bh = Number(b.height) || 0;
+    if (aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0) return false;
+    return a.left < b.left + bw && b.left < a.left + aw && a.top < b.top + bh && b.top < a.top + ah;
+  }
+  /** 框选命中：cards = [{id, rect}]，返回命中的 id（去重、保持 cards 顺序） */
+  function pickCardsInRect(cards, rect) {
+    const out = [];
+    const seen = new Set();
+    (Array.isArray(cards) ? cards : []).forEach((item) => {
+      if (!item || !item.id || seen.has(item.id)) return;
+      if (rectsIntersect(item.rect, rect)) {
+        seen.add(item.id);
+        out.push(String(item.id));
+      }
+    });
+    return out;
+  }
+  /** 连选：从 from 到 to 在 ids 里的闭区间（两端任一找不到就返回空） */
+  function rangeOfIds(ids, from, to) {
+    const list = Array.isArray(ids) ? ids.map(String) : [];
+    const a = list.indexOf(String(from));
+    const b = list.indexOf(String(to));
+    if (a < 0 || b < 0) return [];
+    return list.slice(Math.min(a, b), Math.max(a, b) + 1);
+  }
   // ─── src/ui/DOMPatcher.ts · 播放器 DOM 注入点修补 ──────────────────
   var PLAYER_CONTROL_SELECTOR = '.douyin-player-controls, xg-controls';
   var PLAYER_RIGHT_GRID_SELECTOR = '.douyin-player-controls-right, .xg-right-grid';
@@ -7038,6 +7086,10 @@ return (${body})`
       this.danmakuHandler = options.danmakuHandler;
       this.profilePageHandler = options.profilePageHandler;
       this.observer = new MutationObserver(this._handleMutations.bind(this));
+      this._feedMarqueeBound = false;
+      this._marquee = null;
+      this._lastClickedAwemeId = '';
+      this._suppressCardClickUntil = 0;
       Config.global.events.on('config_change', this._on_config_change.bind(this));
     }
     /**
@@ -7339,6 +7391,8 @@ return (${body})`
         if (!badge) return;
         const media = this.profilePageHandler.dataService._extractFeedMedia(card);
         const awemeId = media && media.awemeId ? String(media.awemeId) : '';
+        // 缓存到选择层上，框选时不必为每张卡重新解析一遍
+        if (awemeId) maskEl.__dyAwemeId = awemeId;
         const rec = awemeId ? PushHistory.get(awemeId) : null;
         if (rec && readPushCfg().badge) {
           badge.textContent = '已推送' + (rec.pushCount > 1 ? ' ×' + rec.pushCount : '');
@@ -7396,6 +7450,7 @@ return (${body})`
       if (!pos || pos === 'static') card.style.position = 'relative';
       const mask = document.createElement('div');
       mask.className = this.feed_card_selector_cls;
+      mask.__dyAwemeId = String(awemeId);
       mask.setAttribute('role', 'button');
       mask.setAttribute('aria-label', '切换视频选择');
       Object.assign(mask.style, {
@@ -7561,8 +7616,22 @@ return (${body})`
       const toggle = (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        const selected = !this.profilePageHandler.downloadManager._isFeedSelected(awemeId);
-        this.profilePageHandler.downloadManager.markSelect(awemeId, selected);
+        // 框选刚结束时浏览器还会补一个 click，这里忽略，避免顺带切换一张卡
+        if (Date.now() < (this._suppressCardClickUntil || 0)) return;
+        const dm = this.profilePageHandler.downloadManager;
+        const id = String(awemeId);
+        // Shift + 点选 = 从上次点的那张连选到这张（按页面顺序）
+        if (ev.shiftKey && this._lastClickedAwemeId && this._lastClickedAwemeId !== id) {
+          const orderedIds = this._feedCardBoxes().map((item) => item.id);
+          const segment = rangeOfIds(orderedIds, this._lastClickedAwemeId, id);
+          if (segment.length) {
+            dm.markSelectMany(segment, true);
+            this._lastClickedAwemeId = id;
+            return;
+          }
+        }
+        dm.markSelect(id, !dm._isFeedSelected(id));
+        this._lastClickedAwemeId = id;
       };
       mask.addEventListener('click', toggle);
       mask.addEventListener('mousedown', (ev) => ev.stopPropagation());
@@ -7574,12 +7643,186 @@ return (${body})`
       this.profilePageHandler.downloadManager.on('countsUpdated', render);
       this.profilePageHandler.downloadManager.on('stateChanged', render);
     }
+    /**
+     * 作者主页的批量选择：拖拽框选 + Shift 连选。
+     *
+     * 卡片整块被选择层（.dy-dl-feed-selector）盖住，所以「按下 - 拖动超过 6px」才判为框选，
+     * 只按不动仍然是普通的点选切换；框选结束后 350ms 内的 click 一律忽略，避免一次拖拽又顺带切换一张卡。
+     * 修饰键：Shift 追加到已有选择，Alt 从已有选择里减掉，都不按则「替换为框中的作品」。
+     */
+    _installFeedMarquee() {
+      if (this._feedMarqueeBound) return;
+      this._feedMarqueeBound = true;
+      document.addEventListener('mousedown', (ev) => this._marqueeDown(ev), true);
+      document.addEventListener('mousemove', (ev) => this._marqueeMove(ev), true);
+      document.addEventListener('mouseup', (ev) => this._marqueeUp(ev), true);
+      document.addEventListener(
+        'keydown',
+        (ev) => {
+          if (ev.key === 'Escape') this._marqueeCancel();
+        },
+        true
+      );
+    }
+    /** 当前页面上的作者主页卡片（按 DOM 顺序，带屏幕矩形） */
+    _feedCardBoxes() {
+      const boxes = [];
+      const seen = new Set();
+      try {
+        document.querySelectorAll('.' + this.feed_card_selector_cls).forEach((maskEl) => {
+          const card = maskEl.parentElement;
+          if (!card) return;
+          // 选择层上缓存过 awemeId 就直接用，没缓存才解析一次（虚拟滚动复用时 _refreshPushedBadge 会刷新它）
+          let id = maskEl.__dyAwemeId ? String(maskEl.__dyAwemeId) : '';
+          if (!id) {
+            const media = this.profilePageHandler?.dataService?._extractFeedMedia(card);
+            id = media && media.awemeId ? String(media.awemeId) : '';
+            if (id) maskEl.__dyAwemeId = id;
+          }
+          if (!id || seen.has(id)) return;
+          seen.add(id);
+          boxes.push({
+            id,
+            maskEl,
+            card,
+            rect: readClientRect(card)
+          });
+        });
+      } catch (err) {
+        console.warn('[dy-dl] 读取主页卡片失败', err);
+      }
+      return boxes;
+    }
+    _ensureMarqueeStyle() {
+      if (document.getElementById('dy-dl-marquee-style')) return;
+      const style = document.createElement('style');
+      style.id = 'dy-dl-marquee-style';
+      style.textContent =
+        '.dy-dl-feed-selector.dy-dl-marquee-hit{outline:2px solid #2f7cf6 !important;outline-offset:-2px !important;' +
+        'background:rgba(47,124,246,0.18) !important;}' +
+        '.dy-dl-feed-selector.dy-dl-marquee-hit .dy-dl-feed-select-label{color:#2f7cf6;font-weight:600;}' +
+        'body.dy-dl-marquee-active{cursor:crosshair !important;user-select:none !important;' +
+        '-webkit-user-select:none !important;}';
+      document.head.appendChild(style);
+    }
+    /** 框选矩形（视口坐标） */
+    _marqueeRect(state, x2, y2) {
+      const left = Math.min(state.startX, x2);
+      const top = Math.min(state.startY, y2);
+      return {
+        left,
+        top,
+        width: Math.abs(x2 - state.startX),
+        height: Math.abs(y2 - state.startY)
+      };
+    }
+    _marqueeDown(ev) {
+      if (ev.button !== 0 || !this.profilePageHandler?.downloadManager) return;
+      const maskEl = ev.target && ev.target.closest ? ev.target.closest('.' + this.feed_card_selector_cls) : null;
+      if (!maskEl) return;
+      this._marquee = {
+        startX: ev.clientX,
+        startY: ev.clientY,
+        additive: Boolean(ev.shiftKey),
+        subtract: Boolean(ev.altKey),
+        moved: false,
+        el: null,
+        boxes: null,
+        hits: []
+      };
+    }
+    /** 画框 + 实时高亮命中卡片；返回本次的框 */
+    _marqueePaint(state, x2, y2) {
+      state.lastX = x2;
+      state.lastY = y2;
+      const now = Date.now();
+      // 拖动过程中页面可能被滚动（滚轮 / 触控板），卡片位置随之变化，定期重读一次
+      if (!state.boxes || now - (state.pickedAt || 0) >= 60) {
+        state.boxes = this._feedCardBoxes();
+        state.pickedAt = now;
+      }
+      const rect = this._marqueeRect(state, x2, y2);
+      if (state.el) {
+        Object.assign(state.el.style, {
+          left: rect.left + 'px',
+          top: rect.top + 'px',
+          width: rect.width + 'px',
+          height: rect.height + 'px'
+        });
+      }
+      const hits = pickCardsInRect(state.boxes || [], rect);
+      state.hits = hits;
+      const hitSet = new Set(hits);
+      (state.boxes || []).forEach((item) => {
+        if (!item.maskEl || !item.maskEl.classList) return;
+        if (hitSet.has(item.id)) item.maskEl.classList.add('dy-dl-marquee-hit');
+        else item.maskEl.classList.remove('dy-dl-marquee-hit');
+      });
+      return rect;
+    }
+    _marqueeMove(ev) {
+      const state = this._marquee;
+      if (!state) return;
+      if (!state.moved) {
+        if (Math.abs(ev.clientX - state.startX) < 6 && Math.abs(ev.clientY - state.startY) < 6) return;
+        state.moved = true;
+        this._ensureMarqueeStyle();
+        try {
+          document.body.classList.add('dy-dl-marquee-active');
+        } catch (err) {}
+        const el = document.createElement('div');
+        el.id = 'dy-dl-marquee-box';
+        el.style.cssText =
+          'position:fixed;z-index:2147483000;pointer-events:none;box-sizing:border-box;' +
+          'border:1.5px dashed #2f7cf6;background:rgba(47,124,246,0.12);border-radius:6px;';
+        document.body.appendChild(el);
+        state.el = el;
+      }
+      ev.preventDefault();
+      this._marqueePaint(state, ev.clientX, ev.clientY);
+    }
+    _marqueeUp(ev) {
+      const state = this._marquee;
+      this._marquee = null;
+      if (!state) return;
+      if (state.moved) {
+        // 松手前可能刚滚过页面，按最新位置重算一次命中
+        state.boxes = this._feedCardBoxes();
+        const rect = this._marqueeRect(state, state.lastX ?? ev.clientX, state.lastY ?? ev.clientY);
+        const hits = pickCardsInRect(state.boxes, rect);
+        this._suppressCardClickUntil = Date.now() + 350;
+        const dm = this.profilePageHandler?.downloadManager;
+        if (dm) {
+          if (state.subtract) dm.markSelectMany(hits, false);
+          else if (state.additive) dm.markSelectMany(hits, true);
+          else if (hits.length) dm.setSelection(hits);
+          if (hits.length) this._lastClickedAwemeId = hits[hits.length - 1];
+        }
+      }
+      this._marqueeCleanup(state);
+    }
+    _marqueeCancel() {
+      const state = this._marquee;
+      this._marquee = null;
+      if (state) this._marqueeCleanup(state);
+    }
+    _marqueeCleanup(state) {
+      try {
+        document.body.classList.remove('dy-dl-marquee-active');
+      } catch (err) {}
+      if (state?.el) state.el.remove();
+      (state?.boxes || []).forEach((item) => {
+        if (item.maskEl && item.maskEl.classList) item.maskEl.classList.remove('dy-dl-marquee-hit');
+      });
+    }
+
     /** 启动 DOM 观察 */
     startObserving() {
       this.observer.observe(document.body, {
         childList: true,
         subtree: true
       });
+      this._installFeedMarquee();
       this._sync_player_controls();
     }
   }
@@ -10780,6 +11023,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
                 ]
               }),
               jsx('div', {
+                style: {
+                  fontSize: '11px',
+                  lineHeight: '16px',
+                  opacity: '0.6',
+                  userSelect: 'none'
+                },
+                children: '选中作品：直接拖拽框选 · Shift 点选连选 · Alt 拖拽减选'
+              }),
+              jsx('div', {
                 className: floatingPanelStyles.progressSection,
                 children: [
                   jsx('div', {
@@ -10827,6 +11079,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
                     className: floatingPanelStyles.btn,
                     onClick: () => downloadManager.markSelectAll(!downloadManager.isSelectAll()),
                     children: downloadManager.isSelectAll() ? '取消全选' : '全选'
+                  }),
+                  jsx('button', {
+                    className: floatingPanelStyles.btn,
+                    onClick: () => downloadManager.invertSelection(),
+                    title: '把已选和未选对调（以当前已发现的作品为全集）',
+                    children: '反选'
                   }),
                   jsx('button', {
                     className: floatingPanelStyles.btn,
@@ -11668,7 +11926,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     /** 调试用：查当前详情页解析到的作品（排查「推送成上一个作品」） */
     resolveCurrentMedia: (timeout) => mediaHandler.resolve_current_media(timeout),
     currentMedia: () => mediaHandler.current_media,
-    pushCurrent: (timeout) => mediaHandler.push_current_to_eagle(timeout)
+    pushCurrent: (timeout) => mediaHandler.push_current_to_eagle(timeout),
+    /** 调试用：作者主页批量选择（框选 / 连选）的状态与纯函数 */
+    selection: {
+      count: () => profilePageHandler.downloadManager.selectedIds.size,
+      ids: () => Array.from(profilePageHandler.downloadManager.selectedIds),
+      set: (ids) => profilePageHandler.downloadManager.setSelection(ids),
+      add: (ids) => profilePageHandler.downloadManager.markSelectMany(ids, true),
+      remove: (ids) => profilePageHandler.downloadManager.markSelectMany(ids, false),
+      invert: () => profilePageHandler.downloadManager.invertSelection(),
+      pickInRect: (cards, rect) => pickCardsInRect(cards, rect),
+      rangeOfIds: (ids, from, to) => rangeOfIds(ids, from, to)
+    }
   };
   // 注意：脚本声明了 @grant，Tampermonkey 会把它放进沙箱运行 —— 此时脚本里的 window
   // 是「沙箱的 window」，页面控制台看不到挂在它上面的属性。所以额外挂到：
@@ -12137,6 +12406,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     }
     isSelectAll() {
       return this.selectedIds.size === this.jobState?.knownIds?.length;
+    }
+    /** 用一批 id 直接替换当前选择（框选默认语义：框住谁就选谁） */
+    setSelection(ids) {
+      const next = new Set();
+      (ids || []).forEach((id) => {
+        if (id) next.add(String(id));
+      });
+      let changed = next.size !== this.selectedIds.size;
+      if (!changed) {
+        for (const id of next) {
+          if (!this.selectedIds.has(id)) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (!changed) return;
+      this.selectedIds = next;
+      this.emit('stateChanged', this);
+      this.emit('countsUpdated', this.getCounts());
+    }
+    /** 反选：以已发现的作品为全集 */
+    invertSelection() {
+      const next = new Set();
+      (this.jobState?.knownIds || []).forEach((id) => {
+        if (!this.selectedIds.has(id)) next.add(id);
+      });
+      this.selectedIds = next;
+      this.emit('stateChanged', this);
+      this.emit('countsUpdated', this.getCounts());
     }
     _isFeedSelected(awemeId) {
       return this.selectedIds.has(awemeId);

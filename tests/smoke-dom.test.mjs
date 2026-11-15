@@ -442,6 +442,36 @@ test('作品切换中按快捷键：明确提示且不调用 Eagle（避免重�
   assert.equal(state.addCalls, 0, '切换中不应调用 Eagle 写入（否则会重复推送上一个作品）');
 });
 
+test('作者主页批量选择：框选命中判定与选择集操作', () => {
+  const sb = runUserscript();
+  const sel = sb.__dyPush.selection;
+  const cards = [
+    { id: 'a', rect: { left: 0, top: 0, width: 100, height: 100 } },
+    { id: 'b', rect: { left: 110, top: 0, width: 100, height: 100 } },
+    { id: 'c', rect: { left: 0, top: 110, width: 100, height: 100 } },
+    { id: 'a', rect: { left: 0, top: 0, width: 100, height: 100 } },
+  ];
+  // 框住 a 的右下角与 b 的左上角
+  assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 50, top: 50, width: 100, height: 100 })), ['a', 'b', 'c']);
+  assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 130, top: 10, width: 20, height: 20 })), ['b']);
+  // 零尺寸 / 完全在框外 → 不命中
+  assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 400, top: 400, width: 0, height: 0 })), []);
+  assert.deepEqual(Array.from(sel.pickInRect(cards, { left: 300, top: 300, width: 50, height: 50 })), []);
+  // 连选：区间含两端，反向也行，找不到任一端返回空
+  assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'a', 'c')), ['a', 'b', 'c']);
+  assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b', 'c', 'd'], 'd', 'b')), ['b', 'c', 'd']);
+  assert.deepEqual(Array.from(sel.rangeOfIds(['a', 'b'], 'a', 'zz')), []);
+  // 替换 / 追加 / 减选
+  sel.set(['x', 'y']);
+  assert.equal(sel.count(), 2);
+  sel.add(['y', 'z']);
+  assert.deepEqual(Array.from(sel.ids()).sort(), ['x', 'y', 'z']);
+  sel.remove(['x']);
+  assert.deepEqual(Array.from(sel.ids()).sort(), ['y', 'z']);
+  sel.set([]);
+  assert.equal(sel.count(), 0);
+});
+
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -604,6 +634,12 @@ test('源码关键片段完整性（防止补丁误删既有代码）', () => {
     ['滚动/播放时提前重读作品', '_watch_media_switch() {'],
     ['主页弹层按 modal_id 取作品', 'modal_id=(\\d{6,})'],
     ['切换中拒绝推送的提示', '作品还在切换，等 1 秒再按一次快捷键'],
+    ['框选命中判定', 'function pickCardsInRect(cards, rect) {'],
+    ['连选区间计算', 'function rangeOfIds(ids, from, to) {'],
+    ['框选事件安装', '_installFeedMarquee() {'],
+    ['框选命中高亮类名', 'dy-dl-marquee-hit'],
+    ['面板「反选」按钮', "children: '反选'"],
+    ['框选操作提示文案', 'Alt 拖拽减选'],
   ];
   const missing = REQUIRED.filter(([, frag]) => !haystack.includes(flatten(frag))).map(([label]) => label);
   assert.deepEqual(missing, [], '源码缺少关键片段：' + missing.join('、'));

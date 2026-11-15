@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.1.1
+// @version         2.1.2
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -5782,6 +5782,8 @@ return (${body})`
   // ─── src/core/eagle/EagleClient.ts · Eagle 本地 API 客户端 ──────────
   var _EagleClient, getEagleClient, eagleClientSingleton, EAGLE_DEFAULT_BASE_URL, EAGLE_API_MAP, EAGLE_MEDIA_HOSTS;
   EAGLE_DEFAULT_BASE_URL = 'http://127.0.0.1:41595';
+  // 文件夹树缓存有效期：Eagle 里改名/删文件夹后，最长这么久一定会重新拉取
+  var FOLDER_TREE_TTL_MS = 10 * 1e3;
   /**
    * 抖音 CDN 域名：这些域名才需要补 Referer / UA。
    */
@@ -5906,6 +5908,12 @@ return (${body})`
       this.baseURL = raw.replace(/\/+$/, '') || EAGLE_DEFAULT_BASE_URL;
       this.apiStyle = null;
       this.folderTree = null;
+      // 文件夹树缓存时间：Eagle 里改了文件夹（作者改名、手动改名、删文件夹）之后，
+      // 旧树会把已删除的文件夹 id 当有效值传回去，Eagle 只会把它丢进「未分类」，
+      // 所以这里必须有有效期，不能整个页面会话一直用第一次拉的树。
+      this.folderTreeAt = 0;
+      // 每个推送批次开头强制重拉一次文件夹树（见 resolveAuthorFolder）
+      this._authorFolderBatchKey = '';
       this.tagNames = null;
       this.lookupCache = new Map();
     }
@@ -6018,7 +6026,8 @@ return (${body})`
      * 拉取文件夹树（自动兼容 v2 的分页扁平结构）并缓存。
      */
     async getFolders(force = false) {
-      if (!force && Array.isArray(this.folderTree)) return this.folderTree;
+      const expired = !this.folderTreeAt || Date.now() - this.folderTreeAt > FOLDER_TREE_TTL_MS;
+      if (!force && Array.isArray(this.folderTree) && !expired) return this.folderTree;
       const style = await this.getApiStyle();
       const all = [];
       if (style === 'v2') {
@@ -6041,6 +6050,7 @@ return (${body})`
         all.push(...EagleClient.extractListData(response));
       }
       this.folderTree = EagleClient.buildFolderTree(all);
+      this.folderTreeAt = Date.now();
       return this.folderTree;
     }
     /**
@@ -6183,14 +6193,28 @@ return (${body})`
      * 解析「作者名」对应的文件夹 id：优先用已有同名文件夹，没有就在
      * parentId（通常是设置里的目标文件夹）下创建；返回空串表示无法定位。
      */
-    async resolveAuthorFolder(authorName, parentId = '') {
+    async resolveAuthorFolder(authorName, parentId = '', batchKey = '') {
       const safe = EagleClient.safeFolderName(authorName);
       if (!safe) return '';
-      const tree = await this.getFolders();
-      const parentNode = parentId ? EagleClient.findFolderById(tree, parentId) : null;
-      const scope = parentNode ? parentNode.children : tree;
-      const found = EagleClient.findFolderByName(scope, safe);
+      const lookup = (tree) => {
+        const parentNode = parentId ? EagleClient.findFolderById(tree, parentId) : null;
+        const scope = parentNode ? parentNode.children : tree;
+        return EagleClient.findFolderByName(scope, safe);
+      };
+      // 每换一个推送批次就重新拉一次树：用户可能在两次推送之间改名 / 删了文件夹，
+      // 用旧树会把已删除的文件夹 id 传回 Eagle，Eagle 只会把它丢进「未分类」。
+      if (batchKey && this._authorFolderBatchKey !== batchKey) {
+        this._authorFolderBatchKey = batchKey;
+        this.folderTree = null;
+        this.folderTreeAt = 0;
+      }
+      const found = lookup(await this.getFolders());
       if (found && found.id) return found.id;
+      // 缓存里没有同名文件夹：可能是作者改了名，也可能是用户在 Eagle 里手动改了名/删了文件夹。
+      // 这时先强制刷新一次树再找，避免又新建一个重复文件夹（新建之后用户一删，
+      // 缓存里就留下一个「名字对但 id 已失效」的节点，之后所有推送都会掉进「未分类」）。
+      const fresh = lookup(await this.getFolders(true));
+      if (fresh && fresh.id) return fresh.id;
       return await this.createFolder(safe, parentId);
     }
     normalizeUrl(url) {
@@ -6591,7 +6615,11 @@ return (${body})`
       let folders = config.folder_id ? [config.folder_id] : [];
       if (config.author_as_folder && authorName) {
         try {
-          const authorFolderId = await client.resolveAuthorFolder(authorName, config.folder_id || '');
+          const authorFolderId = await client.resolveAuthorFolder(
+            authorName,
+            config.folder_id || '',
+            options._dyBatchId || ''
+          );
           if (authorFolderId) folders = [authorFolderId];
         } catch (err) {
           console.warn('[dy-dl] 作者文件夹定位失败，回退到原目标文件夹', err);
@@ -11556,7 +11584,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       blocked: dbIsBlocked(),
       reason: dbBlockedReason || '',
       since: dbBlockedAt || 0
-    })
+    }),
+    /** 调试用：查「作者名 → 文件夹 id」的解析结果（排查推送掉进「未分类」） */
+    resolveAuthorFolder: (name, parentId = '', batchKey = '') =>
+      getEagleClient({
+        baseURL: Config.global.features.downloader_config?.eagle?.base_url
+      }).resolveAuthorFolder(name, parentId, batchKey)
   };
   // 注意：脚本声明了 @grant，Tampermonkey 会把它放进沙箱运行 —— 此时脚本里的 window
   // 是「沙箱的 window」，页面控制台看不到挂在它上面的属性。所以额外挂到：

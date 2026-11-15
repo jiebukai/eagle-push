@@ -190,7 +190,40 @@ function makeBlockedIDB() {
   };
 }
 
-/* ------------------------------ 运行产物 ------------------------------ */function runUserscript({ withIndexedDB = true, idb = null, ls = null } = {}) {
+/** 最小的 Eagle 本地 API 假服务：只用 v1 路由（v2 app info 直接 404 让脚本回退 v1） */
+function makeFakeEagle() {
+  const state = { folders: [], created: [], listCalls: 0 };
+  const gm = (opts) => {
+    const url = String(opts.url || '');
+    let status = 200;
+    let payload = { status: 'success', data: {} };
+    if (url.includes('/api/v2/app/info')) {
+      status = 404;
+      payload = { status: 'error', message: 'not found' };
+    } else if (url.includes('/api/application/info')) {
+      payload = { status: 'success', data: { version: '4.0.0' } };
+    } else if (url.includes('/api/folder/list')) {
+      state.listCalls += 1;
+      payload = { status: 'success', data: state.folders };
+    } else if (url.includes('/api/folder/create')) {
+      const body = JSON.parse(opts.data || '{}');
+      const name = String(body.folderName || '');
+      state.created.push(name);
+      payload = { status: 'success', data: { id: 'new-' + state.created.length } };
+    } else {
+      status = 404;
+      payload = { status: 'error', message: 'not found' };
+    }
+    setTimeout(() => {
+      if (opts.onload) opts.onload({ status, responseText: JSON.stringify(payload) });
+    }, 0);
+    return {};
+  };
+  return { state, gm };
+}
+
+/* ------------------------------ 运行产物 ------------------------------ */
+function runUserscript({ withIndexedDB = true, idb = null, ls = null, gm = null } = {}) {
   const code = readFileSync(ARTIFACT, 'utf8');
   const lsData = new Map(ls ? Object.entries(ls) : []);
   const sandbox = {
@@ -215,7 +248,7 @@ function makeBlockedIDB() {
     MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init && init.detail; } },
     Event: class { constructor(type) { this.type = type; } },
-    GM_xmlhttpRequest: () => {},
+    GM_xmlhttpRequest: gm || (() => {}),
     // 定时器 / 帧回调在测试里一律不执行：产物里有基于 setTimeout 的轮询，
     // 若同步立即执行会形成递归死循环（实测会导致 node --test 超时）。
     setTimeout: () => 1,
@@ -339,6 +372,23 @@ test('indexedDB 被其他标签页占用时快速降级，不把面板 / 推送�
   assert.notEqual(result, 'hang', 'init 不应等待超过 3 秒（实际挂起）');
   assert.equal(sb.__dyPush.count(), 0);
   assert.equal(sb.__dyPush.get('7301234567890123456'), null);
+});
+
+test('文件夹改名 / 被删除后按名字重新解析，不会把作品丢进「未分类」', async () => {
+  const { state, gm } = makeFakeEagle();
+  state.folders = [{ id: 'f1', name: '作者甲' }, { id: 'p1', name: '父目录' }];
+  const sb = runUserscript({ gm });
+  // 1) 已有同名文件夹 → 直接复用
+  assert.equal(await sb.__dyPush.resolveAuthorFolder('作者甲', '', 'b1'), 'f1');
+  // 2) 用户在 Eagle 里把文件夹改成作者的新名字 → 新批次仍复用同一个 id（不能新建）
+  state.folders = [{ id: 'f1', name: '作者乙' }, { id: 'p1', name: '父目录' }];
+  assert.equal(await sb.__dyPush.resolveAuthorFolder('作者乙', '', 'b2'), 'f1');
+  assert.deepEqual(state.created, [], '改名后不应新建文件夹');
+  // 3) 文件夹被删掉 → 新批次必须重新创建，而不是把已失效的 id 传回 Eagle
+  state.folders = [{ id: 'p1', name: '父目录' }];
+  assert.equal(await sb.__dyPush.resolveAuthorFolder('作者乙', '', 'b3'), 'new-1');
+  assert.deepEqual(state.created, ['作者乙']);
+  assert.ok(state.listCalls >= 4, '每个新批次都应重新拉取文件夹树');
 });
 
 /* ------------------ 推送记录层：瘦身 / 轻量索引 / 清理 / 升级 ------------------ */

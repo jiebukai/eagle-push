@@ -802,6 +802,27 @@ test('严格顺序：素材一入队就查得到、但 size 还是 0 时，不�
   );
 });
 
+test('严格顺序：Eagle 的 size 一直是 0 时也不能把整批卡在「内容下载中」', async () => {
+  // gate 很大 = 永远不会补上 size，模拟「素材已在库里、size 恒为 0」的直链条目
+  const { state, gm } = makeFakeEagle({ gate: 999999, queueVisible: true });
+  const sb = runUserscript({ gm });
+  let virtualNow = 1700000000000;
+  sb.Date = class extends Date {
+    static now() { return (virtualNow += 1000); }
+  };
+  sb.setTimeout = (fn) => { fn(); return 1; };
+  const downloader = sb.__dyPush.downloadManager().mediaHandler.downloader;
+  const res = await downloader.download_one_url('https://v3-web.douyinvod.com/z.mp4', '作品Z.mp4', {
+    media: { awemeId: '7300000000000000201', desc: '作品Z', video: {}, authorInfo: { nickname: '作者' } },
+    mediaType: 'video',
+    downloaderOverride: 'eagle',
+    strictOrder: true
+  });
+  assert.equal(res.ok, true, '素材已在库里就该继续，不能挂死');
+  assert.equal(state.addCalls, 1);
+  assert.ok(state.lookupCalls >= 2, '应查询过（实际 ' + state.lookupCalls + ' 次）');
+});
+
 test('源码关键片段完整性（防止补丁误删既有代码）', () => {
   const code = readFileSync(ARTIFACT, 'utf8');
   // 脚本是手写源码风格，换行 / 缩进 / 引号都会随格式化变化，比对前统一压平

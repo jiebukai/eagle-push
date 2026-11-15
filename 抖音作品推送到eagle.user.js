@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            抖音作品推送到eagle
 // @namespace       https://github.com/jiebukai/eagle-push
-// @version         2.3.3
+// @version         2.3.4
 // @description     把抖音作品（视频/图集）推送到 Eagle 素材库，可选目标文件夹与标签；保留上游的下载能力
 // @author          jiebukai
 // @match           https://*.douyin.com/*
@@ -6333,22 +6333,34 @@ return (${body})`
      */
     static async waitUntilIndexed(client, task, options = {}) {
       const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 120000;
+      // 素材已经出现在库里、只是 size 还是 0 时，最多再多等这么久就放行：
+      // Eagle 有些直链入库的条目 size 会一直是 0，死等只会让整批卡在「内容下载中」。
+      const readyTimeoutMs = Number(options.readyTimeoutMs) > 0 ? Number(options.readyTimeoutMs) : 15000;
       const intervalMs = Number(options.intervalMs) > 0 ? Number(options.intervalMs) : 600;
-      const deadline = Date.now() + timeoutMs;
+      const started = Date.now();
+      const deadline = started + timeoutMs;
       let attempt = 0;
+      let found = null;
       while (Date.now() < deadline) {
         attempt += 1;
         try {
           // 第一次立即问，后面按间隔重问
           const item = await client.findExistingItem(task, { fresh: true });
-          // 排队阶段的条目 size 还是 0，这时不能算「已经入库」，
-          // 否则下一件会被提前推出去，入库顺序依旧由 Eagle 的并发下载决定。
-          if (EagleClient.isItemReady(item)) return true;
+          if (item) {
+            found = item;
+            if (EagleClient.isItemReady(item) || Date.now() - started >= readyTimeoutMs) break;
+          }
         } catch (err) {
           // Eagle 偶尔连不上不用中断整批，等下一轮
         }
         if (Date.now() >= deadline) break;
         await new Promise((r) => setTimeout(r, intervalMs));
+      }
+      if (found) {
+        if (!EagleClient.isItemReady(found)) {
+          console.debug('[dy-dl] 素材已在库里但 size 仍为 0（' + attempt + ' 次查询），按已入库继续', task?.name);
+        }
+        return true;
       }
       console.warn('[dy-dl] 等待 Eagle 入库超时（' + attempt + ' 次），继续下一件');
       return false;
@@ -11449,11 +11461,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       request.onerror = () => reject(request.error);
     });
   }
-  function transactionComplete(transaction) {
+  /**
+   * 等一个事务提交。
+   *
+   * 带兜底超时：IndexedDB 有时会卡在「事务不 complete 也不 abort」的状态，
+   * 不设上限就会把整条推送链路挂死（界面表现是「内容下载中」一直不结束）。
+   * 超时只 resolve 不 reject —— 记录写没写进去不该阻塞推送本身。
+   */
+  function transactionComplete(transaction, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      let settled = false;
+      const finish = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(arg);
+      };
+      const timer = setTimeout(() => finish(resolve), timeoutMs);
+      transaction.oncomplete = () => finish(resolve);
+      transaction.onerror = () => finish(reject, transaction.error);
+      transaction.onabort = () => finish(reject, transaction.error);
     });
   }
   /* ====================================================================
